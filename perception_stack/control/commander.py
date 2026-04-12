@@ -25,9 +25,9 @@ from perception_stack.config import (
     UART_ENABLED,
     STOP_BRAKE_DIST_M, BRAKE_VALUE,
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
-    CTRL_LOOKAHEAD_M, CTRL_LATERAL_DEADBAND_M,
-    STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG, STEER_EMA_ALPHA,
-    STEER_TX_DEADBAND_DEG,
+    CTRL_LOOKAHEAD_M, CTRL_LATERAL_DEADBAND_M, CTRL_LATERAL_DEADBAND_FRAC,
+    STEER_MAX_DEG, STEER_MIN_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG,
+    STEER_EMA_ALPHA, STEER_TX_DEADBAND_DEG,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.control.uart import UARTController
@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 def _deg_to_steer_byte(deg: float) -> int:
     """Map ±STEER_MAX_DEG → [0, 255] with 127 = straight."""
-    return int(max(0, min(255, round(127.0 + deg * 127.0 / STEER_MAX_DEG))))
+    return int(max(0, min(255, round(127.0 - deg * 127.0 / STEER_MAX_DEG))))
 
 
 class Commander:
@@ -58,9 +58,11 @@ class Commander:
         self.uart = UARTController()
 
         self._state:          str   = "RUN"
-        self._last_steer:     float = 0.0
-        self._steer_ema:      float = 0.0
-        self._last_sent_deg:  float = 0.0   # last angle actually transmitted to Nucleo
+        self.idle_requested:  bool  = False  # toggled externally by 'i' key
+
+        # Steering EMA state
+        self._steer_ema:           float = 0.0
+        self._last_sent_steer_deg: float = 0.0
 
         # Public state (for display / telemetry)
         self.target_kmh: float = SPEED_TARGET_STRAIGHT_KMH
@@ -94,9 +96,21 @@ class Commander:
         # Read current speed from the LLC UART reader thread (non-blocking)
         self.speed_kmh = self.uart.speed_kmh
 
-        brake   = self._should_brake(result)
-        target  = self._target_speed(result)
-        steer   = self._compute_steer(result)
+        # Manual idle — 'i' key toggles; hold until pressed again to resume
+        if self.idle_requested:
+            if UART_ENABLED:
+                self.uart.set_speed(0.0)
+                self.uart.steer(127)
+            return "IDLE"
+
+        brake  = self._should_brake(result)
+        target = self._target_speed(result)
+
+        # EMA-smooth the raw steer output to kill bang-bang oscillation
+        raw_steer = self._compute_steer(result)
+        self._steer_ema = (STEER_EMA_ALPHA * raw_steer
+                           + (1.0 - STEER_EMA_ALPHA) * self._steer_ema)
+        steer = self._steer_ema
 
         self.target_kmh = target
         self.steer_deg  = steer
@@ -105,15 +119,12 @@ class Commander:
         if UART_ENABLED:
             if brake:
                 self.uart.brake(BRAKE_VALUE)
-                self._last_sent_deg = 0.0   # reset so next RUN sends immediately
             else:
                 self.uart.set_speed(target)
-                # TX dead-band: only send CMD_STEER when the angle has changed
-                # meaningfully from the last transmitted value.  Suppresses rapid
-                # micro-corrections from mask noise — motor only moves for real changes.
-                if abs(steer - self._last_sent_deg) >= STEER_TX_DEADBAND_DEG:
+                # TX deadband — only send when angle changed meaningfully
+                if abs(steer - self._last_sent_steer_deg) >= STEER_TX_DEADBAND_DEG:
                     self.uart.steer(_deg_to_steer_byte(steer))
-                    self._last_sent_deg = steer
+                    self._last_sent_steer_deg = steer
 
         if state != self._state:
             log.info("[Commander] %s → %s  src=%s  spd=%.1f km/h  steer=%.1f deg",
@@ -151,25 +162,21 @@ class Commander:
             deviation_m  > 0 → vehicle LEFT  of centre → correct right (+)
             heading_angle> 0 → lane going right (left curve) → subtract → steer left (−)
 
-        Anti-jitter: clamp → dead-band → rate-limit → EMA.
+        Fixed-increment: dead-band → ±STEER_RATE_DEG step → clamp.
         """
         src = result.source
 
-        # No lane data — reset or decay gently
-        if src in ("DISABLED", "NONE"):
-            self._steer_ema = self._last_steer = 0.0
+        # No lane data — go straight
+        if src in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
             return 0.0
 
-        if src == "LOST" or result.confidence < 0.15:
-            self._steer_ema  *= 0.95   # decay ~5 % per frame toward straight
-            self._last_steer  = self._steer_ema
-            return self._steer_ema
-
-        # Lateral tolerance corridor — zero out small deviations so the car
-        # steers through curves on heading alone, without chasing the centreline.
-        # Only correct laterally when genuinely drifting toward an edge.
-        dev = result.deviation_m
-        if abs(dev) < CTRL_LATERAL_DEADBAND_M:
+        # Adaptive lateral corridor — scales with measured lane width so the
+        # tolerance stays proportional regardless of track geometry.
+        dev      = result.deviation_m
+        deadband = (CTRL_LATERAL_DEADBAND_FRAC * result.lane_width_m
+                    if result.lane_width_m > 0.5
+                    else CTRL_LATERAL_DEADBAND_M)
+        if abs(dev) < deadband:
             dev = 0.0
 
         # Pure Pursuit lateral correction + road-heading feed-forward
@@ -177,19 +184,13 @@ class Commander:
                    - result.heading_angle)
         raw_deg = math.degrees(raw_rad)
 
-        # 1. Clamp to physical range
-        raw_deg = max(-STEER_MAX_DEG, min(STEER_MAX_DEG, raw_deg))
-
-        # 2. Dead-band — ignore corrections smaller than ~2° (mask noise)
+        # Dead-band — within this range, go straight
         if abs(raw_deg) < STEER_DEADBAND_DEG:
-            raw_deg = 0.0
+            return 0.0
 
-        # 3. Rate-limit — one bad Segformer frame can't spin the wheel
-        delta    = max(-STEER_RATE_DEG, min(STEER_RATE_DEG, raw_deg - self._last_steer))
-        rate_lim = self._last_steer + delta
-
-        # 4. EMA — final temporal smoothing
-        self._steer_ema  = (STEER_EMA_ALPHA * rate_lim
-                            + (1.0 - STEER_EMA_ALPHA) * self._steer_ema)
-        self._last_steer = self._steer_ema
-        return self._steer_ema
+        # Scale magnitude from STEER_MIN_DEG (gentle) to STEER_RATE_DEG (sharp),
+        # proportional to how far off-centre pure pursuit says we are.
+        # Direction always comes from the sign of raw_deg — no accumulation.
+        t = min(1.0, (abs(raw_deg) - STEER_DEADBAND_DEG) / max(STEER_MAX_DEG - STEER_DEADBAND_DEG, 1.0))
+        magnitude = STEER_MIN_DEG + t * (STEER_RATE_DEG - STEER_MIN_DEG)
+        return math.copysign(magnitude, raw_deg)

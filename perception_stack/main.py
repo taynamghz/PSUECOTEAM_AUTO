@@ -72,7 +72,7 @@ def main():
         cv2.namedWindow("PSU Eco Racing", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("PSU Eco Racing", 1280, 720)
 
-    print("\nPerception v5 — press Q to quit\n")
+    print("\nPerception v5 — press Q to quit, I to toggle idle\n")
     if LANE_ENABLED:
         print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | {'Steer':>7} | "
               f"{'Spd':>6} | {'Tgt':>6} | {'Cmd':>6} | Stop       | Sign")
@@ -118,6 +118,10 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
+                elif key == ord('i'):
+                    cmd.idle_requested = not cmd.idle_requested
+                    state = "IDLE" if cmd.idle_requested else "RESUMED"
+                    print(f"[main] {'IDLE — motors stopped' if cmd.idle_requested else 'RESUMED — motors active'}")
 
             if fc % 30 == 0:
                 if LANE_ENABLED:

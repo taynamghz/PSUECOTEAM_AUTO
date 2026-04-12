@@ -3,9 +3,9 @@ UART Manual Test — PSU Eco Racing
 Run from AdhamTeam/:  python3 uart_test.py
 
 Keys:
+  s → enter steering angle in degrees  (-STEER_MAX to +STEER_MAX, 0 = centre)
+  t → enter speed in km/h
   1 → MAX BRAKE   (CMD=0x02, val=255)
-  2 → MAX THROTTLE(CMD=0x01, val=255)
-  3 → LOW THROTTLE(CMD=0x01, val=20)   ← config default
   0 → IDLE        (CMD=0x00, val=0)
   q → quit
 """
@@ -22,9 +22,9 @@ sys.modules.setdefault("pyzed.sl", MagicMock())
 sys.path.insert(0, os.path.dirname(__file__))
 
 from perception_stack.control.uart import (
-    UARTController, CMD_IDLE, CMD_THROTTLE, CMD_BRAKE, _build_frame,
+    UARTController, CMD_IDLE, CMD_THROTTLE, CMD_BRAKE, CMD_STEER, _build_frame,
 )
-from perception_stack.config import UART_PORT, UART_BAUD
+from perception_stack.config import UART_PORT, UART_BAUD, STEER_MAX_DEG
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -40,7 +40,7 @@ def show_frame(cmd, val):
     hex_str = " ".join(f"{b:02X}" for b in frame)
     log.debug("  Raw frame bytes: %s", hex_str)
 
-# ── ACK check — reads echo byte from MCU ──────────────────────────────────────
+# ── ACK check ─────────────────────────────────────────────────────────────────
 def check_ack(uart, cmd):
     ser = uart._ser
     ser.timeout = ACK_TIMEOUT
@@ -62,17 +62,29 @@ def getch():
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+# ── Prompt for a value (needs Enter) ──────────────────────────────────────────
+def prompt(msg):
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+    return input()
+
+# ── Degrees → steer byte ──────────────────────────────────────────────────────
+def deg_to_byte(deg: float) -> int:
+    deg = max(-STEER_MAX_DEG, min(STEER_MAX_DEG, deg))
+    return int(round(127.0 - deg * 127.0 / STEER_MAX_DEG))
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n{'='*50}")
     print(f"  UART Manual Test")
     print(f"  Port : {UART_PORT}")
     print(f"  Baud : {UART_BAUD}")
+    print(f"  Steer range: ±{STEER_MAX_DEG}°  (0 = centre)")
     print(f"{'='*50}")
-    print("  [1] MAX BRAKE      (0x02, val=255)")
-    print("  [2] MAX THROTTLE   (0x01, val=255)")
-    print("  [3] LOW THROTTLE   (0x01, val=20)")
-    print("  [0] IDLE           (0x00, val=0)")
+    print("  [s] steer  — enter angle in degrees")
+    print("  [t] speed  — enter speed in km/h")
+    print("  [1] MAX BRAKE")
+    print("  [0] IDLE")
     print("  [q] quit")
     print(f"{'='*50}\n")
 
@@ -92,32 +104,44 @@ def main():
 
     try:
         while True:
-            log.info("Waiting for key press...")
+            log.info("Waiting for key press  (s=steer  t=speed  1=brake  0=idle  q=quit)...")
             key = getch()
 
-            if key == "1":
+            if key in ("s", "S"):
+                sys.stdout.write("\n")
+                raw = prompt(f"  Steering angle (degrees, ±{STEER_MAX_DEG}°, 0=centre): ")
+                try:
+                    deg = float(raw.strip())
+                    byte = deg_to_byte(deg)
+                    log.info(">>> STEER  %.1f°  → byte=%d", deg, byte)
+                    show_frame(CMD_STEER, byte)
+                    uart._last_cmd = -1
+                    ok = uart.steer(byte)
+                    log.info("    send() returned: %s", ok)
+                    check_ack(uart, CMD_STEER)
+                except ValueError:
+                    log.warning("    Invalid input: %r — ignored", raw)
+
+            elif key in ("t", "T"):
+                sys.stdout.write("\n")
+                raw = prompt("  Speed (km/h): ")
+                try:
+                    kmh = float(raw.strip())
+                    log.info(">>> THROTTLE  %.1f km/h", kmh)
+                    uart._last_cmd = -1
+                    ok = uart.set_speed(kmh)
+                    log.info("    send() returned: %s", ok)
+                    check_ack(uart, CMD_THROTTLE)
+                except ValueError:
+                    log.warning("    Invalid input: %r — ignored", raw)
+
+            elif key == "1":
                 log.info(">>> KEY 1 — MAX BRAKE (val=255)")
                 show_frame(CMD_BRAKE, 255)
-                uart._last_cmd = -1   # force resend always during testing
+                uart._last_cmd = -1
                 ok = uart.send(CMD_BRAKE, 255)
                 log.info("    send() returned: %s", ok)
                 check_ack(uart, CMD_BRAKE)
-
-            elif key == "2":
-                log.info(">>> KEY 2 — MAX THROTTLE (val=255)")
-                show_frame(CMD_THROTTLE, 255)
-                uart._last_cmd = -1
-                ok = uart.send(CMD_THROTTLE, 255)
-                log.info("    send() returned: %s", ok)
-                check_ack(uart, CMD_THROTTLE)
-
-            elif key == "3":
-                log.info(">>> KEY 3 — LOW THROTTLE (val=20)")
-                show_frame(CMD_THROTTLE, 20)
-                uart._last_cmd = -1
-                ok = uart.send(CMD_THROTTLE, 20)
-                log.info("    send() returned: %s", ok)
-                check_ack(uart, CMD_THROTTLE)
 
             elif key == "0":
                 log.info(">>> KEY 0 — IDLE")
@@ -127,7 +151,7 @@ def main():
                 log.info("    send() returned: %s", ok)
                 check_ack(uart, CMD_IDLE)
 
-            elif key in ("q", "Q", "\x03"):  # q or Ctrl-C
+            elif key in ("q", "Q", "\x03"):
                 log.info("Quit requested.")
                 break
 
@@ -141,6 +165,7 @@ def main():
         time.sleep(0.05)
         uart.close()
         log.info("UART closed. Bye.")
+
 
 if __name__ == "__main__":
     main()

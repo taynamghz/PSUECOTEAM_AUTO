@@ -20,8 +20,7 @@ The reader thread continuously parses incoming bytes.  main thread reads
 self.speed_kmh at any time — no blocking, no polling.
 
 Watchdog: Nucleo expects a valid TX packet every 200 ms or falls back to manual.
-De-duplication: identical (cmd, val) pairs are not retransmitted UNLESS the
-heartbeat interval has elapsed (prevents bus spam on constant throttle/steer).
+De-duplication: identical (cmd, val) pairs are not retransmitted.
 """
 
 import struct
@@ -31,7 +30,7 @@ import time
 import serial
 
 from perception_stack.config import (
-    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S, UART_HEARTBEAT_S,
+    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S,
 )
 
 log = logging.getLogger(__name__)
@@ -94,7 +93,6 @@ class UARTController:
         self._lock        = threading.Lock()        # protects _ser writes
         self._last_cmd:   int   = -1
         self._last_val:   int   = -1
-        self._last_sent:  float = 0.0
         self.connected:   bool  = False
 
         # RX speed (written by reader thread, read by main thread)
@@ -146,15 +144,12 @@ class UARTController:
     def send(self, cmd: int, value: int = 0) -> bool:
         """
         Transmit one command frame.
-        De-duplicates identical (cmd, value) pairs but forces retransmit every
-        UART_HEARTBEAT_S to keep the Nucleo watchdog (200 ms timeout) alive.
+        Skips retransmit of identical (cmd, value) pairs.
         """
         if not self.connected or self._ser is None:
             return False
 
-        now = time.time()
-        heartbeat_due = (now - self._last_sent) >= UART_HEARTBEAT_S
-        if cmd == self._last_cmd and value == self._last_val and not heartbeat_due:
+        if cmd == self._last_cmd and value == self._last_val:
             return True
 
         frame = _build_frame(cmd, value)
@@ -169,7 +164,6 @@ class UARTController:
 
         self._last_cmd  = cmd
         self._last_val  = value
-        self._last_sent = now
         log.debug("[UART] TX %s val=%d", _CMD_NAME.get(cmd, f"0x{cmd:02X}"), value)
         return True
 
@@ -192,10 +186,22 @@ class UARTController:
 
     def steer(self, value: int = 127) -> bool:
         """
-        Send a steering angle setpoint.
+        Send a steering angle setpoint immediately.
         0 = full left (-STEER_MAX_DEG), 127 = straight (0°), 255 = full right (+STEER_MAX_DEG).
         """
-        return self.send(CMD_STEER, value)
+        if not self.connected or self._ser is None:
+            return False
+        frame = _build_frame(CMD_STEER, value)
+        with self._lock:
+            try:
+                self._ser.write(frame)
+                self._ser.flush()
+            except serial.SerialException as e:
+                log.error("[UART] Write error: %s", e)
+                self.connected = False
+                return False
+        log.debug("[UART] TX STEER val=%d", value)
+        return True
 
     # ── RX reader thread ────────────────────────────────────────────────────────
 

@@ -29,14 +29,76 @@ The result is 1 camera-frame stale on average (≈33 ms at 30 fps, ≈14 cm at 1
 That latency is negligible for lane-following at the speeds used in SEM.
 """
 
+import os
 import queue
 import threading
 import numpy as np
 import cv2
-import torch
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+try:
+    import tensorrt as trt
+    import torch
+    _TRT_AVAILABLE = True
+except ImportError:
+    trt   = None
+    _TRT_AVAILABLE = False
+
+if not _TRT_AVAILABLE:
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
 import torch.nn.functional as F
 
+# ImageNet normalisation (matches SegformerImageProcessor defaults)
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _ort_providers() -> list:
+    available = ort.get_available_providers() if ort else []
+    for ep in ("TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"):
+        if ep in available:
+            return [ep]
+    return ["CPUExecutionProvider"]
+
+
+class _TRTSession:
+    """TensorRT inference via PyTorch CUDA tensors (no pycuda required)."""
+    def __init__(self, engine_path: str):
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f:
+            self._engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+        self._context  = self._engine.create_execution_context()
+        self._tensors  = {}
+        self._bindings = []
+        for i in range(self._engine.num_io_tensors):
+            name  = self._engine.get_tensor_name(i)
+            shape = tuple(self._engine.get_tensor_shape(name))
+            dtype = trt.nptype(self._engine.get_tensor_dtype(name))
+            td    = torch.float16 if dtype == np.float16 else torch.float32
+            t     = torch.zeros(shape, dtype=td, device="cuda")
+            self._tensors[name]  = t
+            self._bindings.append(t.data_ptr())
+
+    def run(self, input_array: np.ndarray) -> np.ndarray:
+        name_in  = self._engine.get_tensor_name(0)
+        name_out = self._engine.get_tensor_name(1)
+        self._tensors[name_in].copy_(
+            torch.from_numpy(input_array).to(
+                dtype=self._tensors[name_in].dtype, device="cuda"))
+        self._context.execute_v2(self._bindings)
+        return self._tensors[name_out].cpu().numpy()
+
+
 from perception_stack.config import (
+    SEG_ENGINE_PATH, SEG_ONNX_PATH, SEG_INPUT_H, SEG_INPUT_W,
     SEG_MODEL_ID,
     SEG_ROAD_CLASSES,
     SEG_ROI_TOP_FRAC,
@@ -81,6 +143,9 @@ class SegformerLane:
     def __init__(self):
         self._model      = None
         self._processor  = None
+        self._session    = None   # ort.InferenceSession or _TRTSession
+        self._trt_mode   = False
+        self._onnx_mode  = False
         self._device     = _best_device()
 
         # EMA on polynomial coefficients (worker thread only — no lock)
@@ -98,17 +163,40 @@ class SegformerLane:
     # ── Initialisation ─────────────────────────────────────────────────────────
 
     def init(self) -> bool:
-        try:
-            from transformers import (SegformerForSemanticSegmentation,
-                                      SegformerImageProcessor)
-            print(f"[SegformerLane] Loading {SEG_MODEL_ID} on {self._device.upper()} ...")
-            self._processor = SegformerImageProcessor.from_pretrained(SEG_MODEL_ID)
-            self._model     = SegformerForSemanticSegmentation.from_pretrained(SEG_MODEL_ID)
-            self._model     = self._model.to(self._device).eval()
-            print("[SegformerLane] Ready.")
-        except Exception as e:
-            print(f"[SegformerLane] init failed: {e}")
-            return False
+        # ── 1. TensorRT engine (fastest) ────────────────────────────────────
+        if _TRT_AVAILABLE and os.path.exists(SEG_ENGINE_PATH):
+            try:
+                print(f"[SegformerLane] Loading TRT engine {SEG_ENGINE_PATH} ...")
+                self._session  = _TRTSession(SEG_ENGINE_PATH)
+                self._trt_mode = True
+                print("[SegformerLane] TRT FP16 ready.")
+            except Exception as e:
+                print(f"[SegformerLane] TRT failed: {e}")
+
+        # ── 2. ONNX Runtime with tuned model ────────────────────────────────
+        if not self._trt_mode and ort is not None and os.path.exists(SEG_ONNX_PATH):
+            try:
+                providers = _ort_providers()
+                print(f"[SegformerLane] Loading ONNX {SEG_ONNX_PATH} ({providers}) ...")
+                self._session   = ort.InferenceSession(SEG_ONNX_PATH, providers=providers)
+                self._onnx_mode = True
+                print(f"[SegformerLane] ONNX ready.")
+            except Exception as e:
+                print(f"[SegformerLane] ONNX failed: {e}")
+
+        # ── 3. HuggingFace model (slowest fallback) ──────────────────────────
+        if not self._trt_mode and not self._onnx_mode:
+            try:
+                from transformers import (SegformerForSemanticSegmentation,
+                                          SegformerImageProcessor)
+                print(f"[SegformerLane] Loading HF model {SEG_MODEL_ID} on {self._device.upper()} ...")
+                self._processor = SegformerImageProcessor.from_pretrained(SEG_MODEL_ID)
+                self._model     = SegformerForSemanticSegmentation.from_pretrained(SEG_MODEL_ID)
+                self._model     = self._model.to(self._device).eval()
+                print("[SegformerLane] HF model ready.")
+            except Exception as e:
+                print(f"[SegformerLane] init failed: {e}")
+                return False
 
         self._thread = threading.Thread(target=self._worker, daemon=True, name="SegformerWorker")
         self._thread.start()
@@ -155,13 +243,34 @@ class SegformerLane:
     def _road_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Run Segformer; return bool mask (H,W) — True = road/drivable."""
         h, w = frame_bgr.shape[:2]
-        rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        inp  = self._processor(images=rgb, return_tensors="pt").to(self._device)
-        with torch.no_grad():
-            logits = self._model(**inp).logits          # (1, C, H/4, W/4)
-        logits_up = F.interpolate(logits, size=(h, w),
-                                  mode="bilinear", align_corners=False)
-        pred = logits_up.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        if self._trt_mode or self._onnx_mode:
+            # Preprocess: BGR→RGB, resize, ImageNet normalise → (1,3,H,W)
+            resized = cv2.resize(frame_bgr, (SEG_INPUT_W, SEG_INPUT_H),
+                                 interpolation=cv2.INTER_LINEAR)
+            rgb    = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            tensor = ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[np.newaxis]  # (1,3,H,W)
+
+            if self._trt_mode:
+                logits = self._session.run(tensor.astype(np.float16))  # (1,2,H/4,W/4)
+            else:
+                inp_name = self._session.get_inputs()[0].name
+                out_name = self._session.get_outputs()[0].name
+                logits = self._session.run([out_name], {inp_name: tensor})[0]
+
+            pred_small = logits[0].argmax(axis=0).astype(np.uint8)
+            pred = cv2.resize(pred_small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        else:
+            # HuggingFace path
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            inp = self._processor(images=rgb, return_tensors="pt").to(self._device)
+            with torch.no_grad():
+                logits = self._model(**inp).logits          # (1, C, H/4, W/4)
+            logits_up = F.interpolate(logits, size=(h, w),
+                                      mode="bilinear", align_corners=False)
+            pred = logits_up.argmax(dim=1).squeeze(0).cpu().numpy()
+
         mask = np.zeros((h, w), dtype=bool)
         for cls in SEG_ROAD_CLASSES:
             mask |= (pred == cls)
