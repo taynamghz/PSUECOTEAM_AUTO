@@ -20,6 +20,7 @@ from perception_stack.config import (
     CTRL_CURVATURE_ALPHA,
     CTRL_EVAL_Y_FRAC,
     ROI_TOP_FRACTION,
+    SEG_FAR_FRAC,
 )
 
 
@@ -95,48 +96,61 @@ def compute_curvature(
 def compute_lookahead(
     lf: Optional[np.ndarray],
     rf: Optional[np.ndarray],
-    pc: np.ndarray,
     H: int,
     W: int,
+    fx: float,
+    depth_arr: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[int, int]]]:
     """
-    Lookahead point on the lane centreline closest to CTRL_LOOKAHEAD_M ahead.
+    Lookahead point on the lane centreline.
 
-    Scans image rows from the ROI top down to the image bottom and finds
-    the centreline pixel whose ZED-measured forward distance (abs Z) is
-    nearest to CTRL_LOOKAHEAD_M.
+    Evaluates the centreline polynomial at SEG_FAR_FRAC (the lookahead row),
+    reads actual ZED Z depth at that pixel via a patch median (handles road
+    slopes, camera tilt, terrain variation), then converts lateral offset to
+    metres via the pinhole model:
+
+        X_m = (cx_pixel - W/2) * Z_m / fx
+
+    Using real Z from ZED means X_m is accurate regardless of road slope or
+    camera mounting variation — no flat-road assumption needed.
+
+    Falls back to CTRL_LOOKAHEAD_M for Z when depth is unavailable or sparse.
 
     Returns
     -------
     world_pt : (X_m, Z_m) | None
-        X_m  — lateral offset in metres (positive = right of camera)
-        Z_m  — forward distance in metres
+        X_m — lateral offset in metres (positive = road centre right of camera)
+        Z_m — actual forward distance to lookahead point in metres
     pixel_pt : (x, y) | None
-        Pixel coordinates of the lookahead point in the camera image.
+        Pixel coordinates of the lookahead point.
     """
     cf = _center_fit(lf, rf)
-    if cf is None:
+    if cf is None or fx <= 0:
         return None, None
 
-    best_world: Optional[Tuple[float, float]] = None
-    best_pixel: Optional[Tuple[int, int]]     = None
-    best_dz = float('inf')
+    y_look = int(H * SEG_FAR_FRAC)
+    cx = float(np.polyval(cf, y_look))
+    if not (0.0 <= cx <= W):
+        return None, None
 
-    for y in range(int(H * ROI_TOP_FRACTION), H, 4):
-        cx = int(np.clip(np.polyval(cf, y), 0, W - 1))
-        pt = pc[y, cx, :3]
-        if not np.isfinite(pt).all():
-            continue
-        z_fwd = abs(float(pt[2]))   # ZED RIGHT_HANDED_Y_UP: forward = −Z → abs
-        if z_fwd <= 0.0:
-            continue
-        dz = abs(z_fwd - CTRL_LOOKAHEAD_M)
-        if dz < best_dz:
-            best_dz  = dz
-            best_world = (float(pt[0]), z_fwd)
-            best_pixel = (cx, int(y))
+    cx_int = int(np.clip(cx, 0, W - 1))
 
-    return best_world, best_pixel
+    # Sample a patch of ZED depth around the centerline pixel.
+    # Median over the patch rejects NaN holes and single-pixel outliers.
+    # Falls back to assumed depth when the patch has insufficient valid pixels.
+    Z_m = CTRL_LOOKAHEAD_M   # default fallback
+    if depth_arr is not None:
+        pad = 5
+        r0, r1 = max(0, y_look - pad), min(H, y_look + pad + 1)
+        c0, c1 = max(0, cx_int  - pad), min(W, cx_int  + pad + 1)
+        patch = depth_arr[r0:r1, c0:c1]
+        valid = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
+        if valid.size >= 4:
+            Z_m = float(np.median(valid))
+
+    X_m      = (cx - W / 2.0) * Z_m / fx
+    pixel_pt = (cx_int, y_look)
+    return (X_m, Z_m), pixel_pt
 
 
 # ── Temporal smoother for scalar control outputs ───────────────────────────────

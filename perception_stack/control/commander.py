@@ -25,8 +25,8 @@ from perception_stack.config import (
     UART_ENABLED,
     STOP_BRAKE_DIST_M, BRAKE_VALUE,
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
-    CTRL_LOOKAHEAD_M, CTRL_LATERAL_DEADBAND_M, CTRL_LATERAL_DEADBAND_FRAC,
-    STEER_MAX_DEG, STEER_MIN_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG,
+    WHEELBASE_M, CTRL_LOOKAHEAD_M, CTRL_LANE_DEADBAND_M,
+    STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_LIMIT_DEG,
     STEER_EMA_ALPHA, STEER_TX_DEADBAND_DEG,
 )
 from perception_stack.models import PerceptionResult
@@ -60,8 +60,9 @@ class Commander:
         self._state:          str   = "RUN"
         self.idle_requested:  bool  = False  # toggled externally by 'i' key
 
-        # Steering EMA state
+        # Steering state
         self._steer_ema:           float = 0.0
+        self._last_raw_steer:      float = 0.0   # for rate limiter
         self._last_sent_steer_deg: float = 0.0
 
         # Public state (for display / telemetry)
@@ -106,8 +107,16 @@ class Commander:
         brake  = self._should_brake(result)
         target = self._target_speed(result)
 
-        # EMA-smooth the raw steer output to kill bang-bang oscillation
         raw_steer = self._compute_steer(result)
+
+        # Rate limiter — cap how fast the commanded angle can change per frame.
+        # Prevents a single bad Segformer frame from yanking the EMA significantly.
+        delta = raw_steer - self._last_raw_steer
+        if abs(delta) > STEER_RATE_LIMIT_DEG:
+            raw_steer = self._last_raw_steer + math.copysign(STEER_RATE_LIMIT_DEG, delta)
+        self._last_raw_steer = raw_steer
+
+        # EMA — smooths mechanical jitter and residual frame-to-frame noise
         self._steer_ema = (STEER_EMA_ALPHA * raw_steer
                            + (1.0 - STEER_EMA_ALPHA) * self._steer_ema)
         steer = self._steer_ema
@@ -156,41 +165,44 @@ class Commander:
 
     def _compute_steer(self, result: PerceptionResult) -> float:
         """
-        steer_rad = atan(deviation_m / lookahead_m) − heading_angle
+        Geometric Pure Pursuit:
+            delta = atan2(2 * L * X_m,  ld²)
 
-        Sign conventions (both must agree):
-            deviation_m  > 0 → vehicle LEFT  of centre → correct right (+)
-            heading_angle> 0 → lane going right (left curve) → subtract → steer left (−)
+        Where:
+            X_m = lateral offset of the 3D lookahead point (positive = right of camera)
+            ld  = Euclidean distance to the lookahead point  = hypot(X_m, Z_m)
+            L   = vehicle wheelbase (WHEELBASE_M)
 
-        Fixed-increment: dead-band → ±STEER_RATE_DEG step → clamp.
+        This is derived from the standard formula  delta = atan(2L sin(α) / ld)
+        with α = atan2(X_m, Z_m),  sin(α) = X_m / ld  →  atan2(2L·X_m, ld²).
+
+        Sign: X_m > 0 (lookahead right of camera) → steer right (+).
+              Vehicle left of centre → road centre is to the right → X_m > 0. Correct.
+
+        Fallback (no ZED depth at lookahead): approximate with near-point deviation.
         """
-        src = result.source
-
-        # No lane data — go straight
-        if src in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
+        if result.source in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
             return 0.0
 
-        # Adaptive lateral corridor — scales with measured lane width so the
-        # tolerance stays proportional regardless of track geometry.
-        dev      = result.deviation_m
-        deadband = (CTRL_LATERAL_DEADBAND_FRAC * result.lane_width_m
-                    if result.lane_width_m > 0.5
-                    else CTRL_LATERAL_DEADBAND_M)
-        if abs(dev) < deadband:
-            dev = 0.0
+        if result.lookahead_point is not None:
+            X_m, Z_m = result.lookahead_point
+            # Lane deadband — don't correct small wandering near centre.
+            # Only steer when the car has drifted meaningfully toward the edge.
+            if abs(X_m) < CTRL_LANE_DEADBAND_M:
+                return 0.0
+            ld = math.hypot(X_m, Z_m)
+            if ld < 0.1:
+                return 0.0
+            raw_rad = math.atan2(2.0 * WHEELBASE_M * X_m, ld * ld)
+        else:
+            # ZED had no valid depth at the lookahead row — fall back to deviation.
+            dev = result.deviation_m
+            if abs(dev) < CTRL_LANE_DEADBAND_M:
+                return 0.0
+            ld  = CTRL_LOOKAHEAD_M
+            raw_rad = math.atan2(2.0 * WHEELBASE_M * dev, ld * ld)
 
-        # Pure Pursuit lateral correction + road-heading feed-forward
-        raw_rad = (math.atan(dev / max(CTRL_LOOKAHEAD_M, 0.1))
-                   - result.heading_angle)
         raw_deg = math.degrees(raw_rad)
 
-        # Dead-band — within this range, go straight
-        if abs(raw_deg) < STEER_DEADBAND_DEG:
-            return 0.0
-
-        # Scale magnitude from STEER_MIN_DEG (gentle) to STEER_RATE_DEG (sharp),
-        # proportional to how far off-centre pure pursuit says we are.
-        # Direction always comes from the sign of raw_deg — no accumulation.
-        t = min(1.0, (abs(raw_deg) - STEER_DEADBAND_DEG) / max(STEER_MAX_DEG - STEER_DEADBAND_DEG, 1.0))
-        magnitude = STEER_MIN_DEG + t * (STEER_RATE_DEG - STEER_MIN_DEG)
-        return math.copysign(magnitude, raw_deg)
+        # Hardware clamp — only limit at servo physical limit
+        return max(-STEER_MAX_DEG, min(STEER_MAX_DEG, raw_deg))

@@ -86,36 +86,29 @@ SPEED_TARGET_CURVE_KMH    = 3.0    # reduced speed through corners
 SPEED_CURVE_THRESH        = 0.15   # |κ| (m⁻¹) above which we slow to curve speed
 
 # ── Lane-following control (Pure Pursuit) ─────────────────────────────────────
-CTRL_LOOKAHEAD_M     = 2.2   # lookahead distance for Pure Pursuit (metres)
-CTRL_HEADING_ALPHA   = 0.20  # EMA alpha for heading angle  (lower = smoother)
-CTRL_CURVATURE_ALPHA = 0.15  # EMA alpha for curvature      (extra-smooth)
-CTRL_EVAL_Y_FRAC     = 0.60  # image-row fraction to evaluate heading/curvature
+WHEELBASE_M              = 1.6   # vehicle wheelbase — VERIFY before first run
+CTRL_LOOKAHEAD_M         = 2.2   # assumed depth to road centre at the far row (metres)
+                                  # calibrate: drive toward a mark 2.2m away, check X_m ≈ 0
+CTRL_LANE_DEADBAND_M     = 0.15  # ignore lateral offsets smaller than this (metres)
+                                  # car can wander ±15cm from centre without correction
+                                  # increase for more relaxed lane-keeping, decrease for tighter tracking
+CTRL_HEADING_ALPHA       = 0.20  # EMA alpha for heading angle  (lower = smoother)
+CTRL_CURVATURE_ALPHA     = 0.15  # EMA alpha for curvature      (extra-smooth)
+CTRL_EVAL_Y_FRAC         = 0.60  # image-row fraction to evaluate heading/curvature
 
-# Lateral tolerance corridor — only apply lateral correction when the car drifts
-# beyond this distance from the lane centre.  Inside the band, deviation is zeroed
-# and the car is steered purely by road heading (curvature feed-forward).
-# Goal: stay on track and take curves safely, not chase the exact centreline.
-# Adaptive: scales with measured lane width so the corridor stays proportional.
-# e.g. 3 m lane → ±0.45 m corridor (middle 70%).  1.5 m lane → ±0.23 m corridor.
-# Falls back to CTRL_LATERAL_DEADBAND_M when lane width is unknown.
-CTRL_LATERAL_DEADBAND_FRAC = 0.085  # fraction of lane width — tighter centering
-CTRL_LATERAL_DEADBAND_M    = 0.15   # fallback when lane_width_m is unavailable
-
-# ── Steering output (anti-jitter stack) ───────────────────────────────────────
+# ── Steering output ────────────────────────────────────────────────────────────
 # Data flow every frame:
-#   Pure Pursuit → clamp → dead-band → rate-limit → EMA → UART byte (0-255)
+#   Pure Pursuit (geometric angle) → rate-limit → deadband → clamp → EMA → UART byte
 #
 # 0   = full left  (-STEER_MAX_DEG)
 # 127 = straight   (0°)
 # 255 = full right (+STEER_MAX_DEG)
-STEER_MAX_DEG         = 25.0  # maximum steering angle — increase once tracking is stable
-STEER_MIN_DEG         = 1.0   # minimum output for any correction outside deadband (soft entry)
-STEER_DEADBAND_DEG    = 3.0   # ignore corrections smaller than this (mask noise)
-STEER_RATE_DEG        = 8.0   # maximum output for sharp corrections (was 15 — too aggressive)
-STEER_EMA_ALPHA       = 0.10  # EMA weight — lower = smoother/slower response (was 0.15)
-STEER_TX_DEADBAND_DEG = 2.0   # only transmit CMD_STEER if angle changed by more than
-                               # this from the last SENT value.  Suppresses rapid
-                               # micro-corrections from mask noise reaching the motor.
+STEER_MAX_DEG           = 25.0  # hardware clamp — servo physical limit
+STEER_DEADBAND_DEG      = 2.0   # ignore corrections smaller than this (mask noise)
+STEER_RATE_LIMIT_DEG    = 5.0   # max change per frame — prevents jolts from bad Segformer frames
+STEER_EMA_ALPHA         = 0.20  # EMA weight — lower = smoother, higher = more responsive
+STEER_TX_DEADBAND_DEG   = 1.5   # only transmit CMD_STEER if angle changed by more than
+                                 # this from the last SENT value.
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True

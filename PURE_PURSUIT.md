@@ -1,287 +1,359 @@
-# Pure Pursuit Controller — Full Explanation & Tuning Guide
+# Pure Pursuit Controller — Testing & Tuning Guide
 
 **PSU Eco Racing — Shell Eco-Marathon Autonomous Division**
 
 ---
 
-## 1. The Core Idea
+## 1. What the Controller Does
 
-Pure Pursuit asks one simple question every frame:
+The goal is **safe lane keeping**, not exact centerline tracking. The car stays comfortably within the lane on straights and turns correctly through curves. Small wandering in the middle of the lane is ignored — the controller only activates when the car drifts meaningfully toward the edge.
 
-> **"If I draw a straight line from the car to a point on the road ahead, what angle do I need to steer to follow that line?"**
+---
 
-That point ahead is called the **lookahead point**. The further ahead you look, the smoother but slower the response. The closer you look, the more reactive but twitchier the steering.
+## 2. How It Works — Full Pipeline
+
+Every frame goes through this chain:
 
 ```
-         lookahead point (2.2m ahead on centerline)
-              ●
-             /
-            /  ← steer angle = atan(deviation / lookahead_distance)
-           /
-          ● ← car position (camera center)
+ZED 2i camera
+  │
+  ├─ CLAHE lighting normalisation
+  │
+  ├─ Segformer-B2 [background thread]
+  │     → road mask → centerline polynomial x = f(y)
+  │
+  ├─ compute_lookahead()
+  │     → evaluate polynomial at far row (SEG_FAR_FRAC = 0.65H)
+  │     → read ZED depth (single-channel, cached every 4 frames) at that pixel
+  │     → X_m = (cx_pixel - W/2) × Z_m / fx    [pinhole, real Z]
+  │     → Z_m = actual ZED depth at that row     [handles slopes, tilts]
+  │
+  ├─ Lane deadband gate
+  │     → if |X_m| < CTRL_LANE_DEADBAND_M (0.15m)  →  steer 0°, go straight
+  │
+  ├─ Pure Pursuit formula
+  │     → delta = atan2(2 × L × X_m,  ld²)
+  │     → ld = hypot(X_m, Z_m)
+  │     → L = WHEELBASE_M (1.6m)
+  │
+  ├─ Rate limiter
+  │     → max STEER_RATE_LIMIT_DEG (5°) change per frame
+  │
+  ├─ EMA smoother
+  │     → STEER_EMA_ALPHA = 0.20
+  │
+  ├─ Hardware clamp
+  │     → ±STEER_MAX_DEG (25°)
+  │
+  └─ TX deadband
+        → only sends UART if angle changed > STEER_TX_DEADBAND_DEG (1.5°)
+        → CMD_STEER byte (0=full-left, 127=centre, 255=full-right) → Nucleo
 ```
 
-That's literally the entire algorithm. Everything else in the code is perception, smoothing, and safety.
+**Depth strategy:**
+- `MEASURE.DEPTH` (Z only, 3.7 MB) — retrieved every 4 frames for steering
+- `MEASURE.XYZ` (full 3D, 11 MB) — retrieved only when stop-sign or stop-line votes are active
 
 ---
 
-## 2. How It Flows Frame by Frame
+## 3. The Formula
 
 ```
-Camera frame
-    ↓
-CLAHE lighting normalisation
-    ↓
-Segformer ONNX → road mask (True/False per pixel)
-    ↓
-Scan road pixels row by row → find centerline
-    ↓
-Fit quadratic polynomial to centerline
-    ↓
-Evaluate at 85% of frame height → deviation_m (how far left/right of center)
-Evaluate polynomial slope at 72% → heading_angle (which way road is turning)
-    ↓
-Pure Pursuit formula:
-    raw = atan(deviation_m / 2.2) − heading_angle
-    ↓
-Deadband → magnitude scaling → EMA smoothing
-    ↓
-UART byte → Nucleo → servo
+delta = atan2(2 × L × X_m,  ld²)
 ```
 
----
+Derived from standard pure pursuit `delta = atan(2L sin(α) / ld)` with `sin(α) = X_m / ld`.
 
-## 3. The Pure Pursuit Formula in Detail
+- **X_m** — lateral offset of road center at lookahead distance. Positive = road is to the right (vehicle is left of center). Negative = road is to the left.
+- **ld** — true Euclidean distance to that point = `hypot(X_m, Z_m)`
+- **L** — wheelbase in metres
 
-From `commander.py`:
+The formula is proportional — small offsets give small angles, large offsets give large angles:
 
-```python
-raw_rad = math.atan(dev / max(CTRL_LOOKAHEAD_M, 0.1)) - result.heading_angle
-```
-
-### Part 1: `atan(dev / lookahead)`
-
-`dev` = how many metres the car is from the road center (positive = car is left of center).
-`CTRL_LOOKAHEAD_M = 2.2` = how far ahead on the road you are aiming at.
-
-Think of it as a triangle:
-- The base is `dev` — how far sideways you are
-- The height is `2.2m` — how far ahead the target is
-- The angle at the bottom is what you need to steer
-
-```
-         target
-           ●
-           |
-    2.2m   |
-           |
-   car ●───┘  dev = 0.3m
-
-   steer angle = atan(0.3 / 2.2) = 7.8°
-```
-
-If `dev = 0` (perfectly centered), `atan(0) = 0` — steer straight.
-If `dev = 0.5m` off center with 2.2m lookahead → steer `atan(0.5/2.2) = 12.8°`.
-
-Clean, intuitive, no magic.
-
-### Part 2: `- result.heading_angle`
-
-`heading_angle` is the polynomial slope at the lookahead row — it tells you which direction the road is curving ahead. Subtracting it means: if the road curves left, pre-steer left **before you even drift**. This is the feedforward that makes turns smooth.
-
-Without this term, the car waits until it physically drifts before correcting — always late into corners. With it, the car starts turning the moment it sees the road turning ahead.
-
----
-
-## 4. What Happens After the Raw Angle
-
-```python
-# Step 1 — Deadband: ignore tiny corrections (noise)
-if abs(raw_deg) < STEER_DEADBAND_DEG:   # 3°
-    return 0.0
-
-# Step 2 — Magnitude scaling: map error size to output size
-t = (|raw_deg| - deadband) / (max_deg - deadband)   # 0.0 to 1.0
-magnitude = STEER_MIN_DEG + t × (STEER_RATE_DEG - STEER_MIN_DEG)
-output = sign(raw_deg) × magnitude
-
-# Step 3 — EMA smoothing (in commander.update)
-steer_ema = STEER_EMA_ALPHA × output + (1 - STEER_EMA_ALPHA) × previous_ema
-```
-
-**Step 1 — Deadband:**
-Corrections under 3° are road mask noise. Zeroing them out stops the servo jittering constantly on straights.
-
-**Step 2 — Magnitude scaling:**
-Instead of sending the raw angle directly, it maps the error size onto a range from `STEER_MIN_DEG` to `STEER_RATE_DEG`:
-- Small error → gentle correction near `1°`
-- Large error → sharp correction up to `8°`
-
-The **direction** always comes from Pure Pursuit. Only the **magnitude** is scaled. This prevents small road mask noise from causing large servo commands.
-
-**Step 3 — EMA:**
-With `STEER_EMA_ALPHA = 0.10`, the output is very heavily smoothed. Each new frame contributes only 10%, the previous history contributes 90%. Steering changes gradually — never suddenly.
-
----
-
-## 5. Every Config Parameter Explained
-
-### `CTRL_LOOKAHEAD_M = 2.2`
-**The most important parameter.**
-How far ahead on the road the car is aiming at, in metres.
-- **Larger (3.0m+):** Smoother, slower to react — good for straights and wide gentle curves
-- **Smaller (1.5m):** Reacts faster, tighter line through curves — risks oscillation
-
----
-
-### `SPEED_TARGET_STRAIGHT_KMH = 3.0` / `SPEED_TARGET_CURVE_KMH = 3.0`
-Target speed sent to the Nucleo in km/h. Both are currently identical — the car runs at 3 km/h everywhere. When you're confident in the lane keeping, set `SPEED_TARGET_STRAIGHT_KMH` higher and keep `SPEED_TARGET_CURVE_KMH` conservative.
-
-### `SPEED_CURVE_THRESH = 0.15`
-When the measured road curvature exceeds 0.15 m⁻¹ (a real turn), the car switches from straight speed to curve speed. A value of 0.15 m⁻¹ corresponds to roughly a 6.5m radius corner.
-
----
-
-### `CTRL_LATERAL_DEADBAND_FRAC = 0.085`
-The car ignores lateral error when it's within `8.5% × lane_width` of center. On a 1.5m track that's ±13cm. Inside this corridor only the heading term runs — the car follows the road direction without trying to correct tiny lateral drift. This prevents constant micro-corrections on straights.
-
-### `CTRL_LATERAL_DEADBAND_M = 0.15`
-Fallback corridor in metres when lane width measurement is unavailable. ±15cm.
-
----
-
-### `STEER_MAX_DEG = 25.0`
-Hardware clamp. The servo physically cannot go beyond ±25°. Any larger computed angle is clamped here.
-
-### `STEER_MIN_DEG = 1.0`
-Minimum output magnitude for any correction that makes it past the deadband. Ensures corrections have a soft, smooth entry rather than jumping from 0 to a large angle instantly.
-
-### `STEER_DEADBAND_DEG = 3.0`
-Corrections smaller than 3° are zeroed out completely. Mask noise, vibration, and minor polynomial jitter all produce sub-3° signals — this eliminates them.
-
-### `STEER_RATE_DEG = 8.0`
-Maximum correction output per update. Even if the car is severely off-center, the servo only gets commanded 8° per frame. Prevents aggressive overcorrection.
-
-### `STEER_EMA_ALPHA = 0.10`
-How much each new frame contributes to the smoothed steering output.
-- `0.10` = very smooth, slow response (~20 frames to reach full correction)
-- `0.25` = faster response, more reactive
-- `0.40` = very responsive, risk of oscillation
-
-### `STEER_TX_DEADBAND_DEG = 2.0`
-The UART command is only transmitted when the steering setpoint changes by more than 2° from the last sent value. Prevents flooding the bus with redundant identical commands on straights.
-
----
-
-### `SEG_NEAR_FRAC = 0.85`
-Where on the image (as a fraction of frame height, from the top) the lateral deviation is measured. At 85% height the road is roughly 1–2m in front of the car — close, stable, reliable pixels.
-
-### `SEG_FAR_FRAC = 0.65`
-Where heading angle is evaluated. At 65% height the road is further ahead — gives early warning of upcoming curves.
-
-### `SEG_FIT_TOP_FRAC = 0.72`
-The polynomial is only fitted to rows **below** 72% of frame height. Rows above this are far away, pixels are small and noisy — fitting them causes the polynomial to blow up. 72% corresponds to roughly 2.5m lookahead.
-
-### `SEG_CENTERLINE_ALPHA = 0.30`
-The polynomial coefficients themselves are EMA-smoothed across frames. Each new frame contributes 30%, history contributes 70%. Makes the centerline estimate stable across noisy mask frames.
-
-### `SEG_BOUNDARY_ROWS = 30`
-Number of rows scanned per frame to build the centerline. 30 rows evenly distributed across the fitted zone. More rows = more stable polynomial, slightly more CPU.
-
-### `SEG_SKIP_STRAIGHT = 1` / `SEG_SKIP_CURVE = 1`
-How often a new frame is submitted to Segformer for inference. Both are 1 = every frame. Previously on straights this was 5 (every 5th frame) to save power, but it's been set to 1 for maximum freshness. On the Jetson with TensorRT this is fine. On CPU only, you may want to raise `SEG_SKIP_STRAIGHT` back to 3–5 to reduce thermal load.
-
----
-
-## 6. The Single Most Important Thing to Understand
-
-**Pure Pursuit has no speed compensation.**
-
-At 3 km/h and `CTRL_LOOKAHEAD_M = 2.2`, the car looks 2.2m ahead and steers accordingly. If you run at 6 km/h with the same lookahead, the car covers that 2.2m in half the time — it reacts much later in the turn. Curves feel wider and later.
-
-**Rule of thumb: if you double the speed, shorten the lookahead by ~20–30%.**
-
-| Speed | Recommended Lookahead |
+| X_m at lookahead | Steering angle (L=1.6m, Z=2.2m) |
 |---|---|
-| 3 km/h | 2.0 – 2.5 m |
-| 5 km/h | 1.8 – 2.2 m |
-| 8 km/h | 1.5 – 1.8 m |
-| 10 km/h | 1.3 – 1.6 m |
+| 5 cm | ~1.6° |
+| 10 cm | ~3.2° |
+| 15 cm (deadband edge) | ~4.7° |
+| 25 cm | ~7.7° |
+| 50 cm | ~14° |
+| 80 cm | ~21° |
+| 120 cm+ | clamped at 25° |
 
 ---
 
-## 7. Tuning Guide — Step by Step
+## 4. All Tuning Parameters
 
-### Step 1: Straight-line stability first
+All parameters live in `perception_stack/config.py`. Only touch the ones listed here.
 
-Before touching curves, get the car to hold a straight line cleanly.
+### Group 1 — Must Verify Before Any Test
 
-Set `CTRL_LOOKAHEAD_M = 2.2`, `STEER_EMA_ALPHA = 0.10`, drive straight.
+| Parameter | Default | What it is |
+|---|---|---|
+| `WHEELBASE_M` | `1.6` | Axle-to-axle distance in metres. **Measure physically.** Wrong value = systematic over/under-steer on every curve. |
+| `UART_ENABLED` | `True` | Set `False` for dry runs (no motor output). Always start here. |
+
+### Group 2 — Primary Tuning (these matter most)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `CTRL_LANE_DEADBAND_M` | `0.15` | Lateral tolerance in metres. Car ignores offsets smaller than this. **0.15 = ±15cm corridor**. Increase for more relaxed driving, decrease for tighter tracking. |
+| `CTRL_LOOKAHEAD_M` | `2.2` | Assumed depth to the far row. Affects how strongly the formula responds. Larger = smoother but slower to react to curves. Smaller = tighter but more reactive. Calibrate once on your track. |
+| `STEER_EMA_ALPHA` | `0.20` | How fast the steering responds. Lower = smoother/slower. Higher = more responsive but more chatter. Range: 0.10–0.35. |
+
+### Group 3 — Smoothing & Safety
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `STEER_RATE_LIMIT_DEG` | `5.0` | Max steering change per frame at 30fps. Clips jolts from single bad Segformer frames. Lower = smoother but may slow curve entry. |
+| `STEER_MAX_DEG` | `25.0` | Hardware clamp. Must match your servo's physical limit. |
+| `STEER_TX_DEADBAND_DEG` | `1.5` | Only sends a new UART command if angle changed by this much. Reduces servo hunting on straights. |
+| `PC_REFRESH_EVERY` | `4` | Depth map refresh rate in frames. Every 4 frames at 30fps = 7.5 Hz. Lower = fresher depth, more CPU. Higher = staler depth, less CPU. |
+
+### Group 4 — Do Not Touch During Testing
+
+| Parameter | Reason |
+|---|---|
+| `SEG_FAR_FRAC` | Defines which image row is the lookahead row. Changing this changes the geometry of the entire formula. |
+| `WHEELBASE_M` | Verify once, then lock. |
+| `STEER_MAX_DEG` | Hardware limit — never exceed the servo spec. |
+
+---
+
+## 5. Before the First Test — Checklist
+
+Work through this in order. Do not skip steps.
+
+### Step 0 — Measure wheelbase
+
+Measure axle center to axle center in metres. Update `WHEELBASE_M`. This is the most important physical calibration.
+
+### Step 1 — Dry run (no motor output)
+
+Set `UART_ENABLED = False` in `config.py`. Run:
+
+```bash
+python -m perception_stack.main
+```
+
+Watch the console output:
+```
+Frame |    Source |  Dev(m) |   Steer | Spd | Tgt | Cmd | Stop | Sign
+```
+
+Walk slowly in front of the camera, side to side. Verify:
+- `Source` shows `SEGFORMER` (not `LOST`)
+- `Steer` is near `0.0` when you are centered
+- `Steer` grows in magnitude as you move off-center
+- `Steer` sign flips when you cross center
+
+If `Source` is always `LOST` — Segformer is not detecting the road. Check lighting and model path.
+
+### Step 2 — Verify steering sign (vehicle raised off ground)
+
+Set `UART_ENABLED = True`. Raise the front of the vehicle so wheels spin freely.
+
+Stand to the **right** of the camera (road center appears to the left from camera's perspective):
+- `X_m` should be **negative**
+- Front wheels should steer **left**
+
+Stand to the **left** of the camera (road center appears to the right):
+- `X_m` should be **positive**
+- Front wheels should steer **right**
+
+**If wheels turn the wrong direction:** open `commander.py`, find `_compute_steer()`, change:
+```python
+raw_rad = math.atan2(2.0 * WHEELBASE_M * X_m, ld * ld)
+```
+to:
+```python
+raw_rad = math.atan2(2.0 * WHEELBASE_M * (-X_m), ld * ld)
+```
+
+### Step 3 — Verify lookahead depth (calibration)
+
+With the vehicle stationary and `UART_ENABLED = False`, temporarily add this print inside `_compute_steer` in `commander.py`:
+
+```python
+if result.lookahead_point is not None:
+    X_m, Z_m = result.lookahead_point
+    print(f"  lookahead  X={X_m:+.3f}m  Z={Z_m:.3f}m")
+```
+
+Place a mark on the ground directly ahead, exactly **2.2m** from the camera. Point the camera at it centered. `Z_m` should read close to **2.2**. If it reads consistently 1.8 or 2.6, update `CTRL_LOOKAHEAD_M` to match what ZED actually measures at that row.
+
+Remove the print before live testing.
+
+### Step 4 — Check lookahead is not always None
+
+In the dry run console, if `Steer` is always exactly `0.0` even when you are far off center, the lookahead_point may be returning `None` constantly (falling back to deviation_m path).
+
+Temporarily add:
+```python
+print("lookahead:", result.lookahead_point)
+```
+
+in `main.py` after `result, frame, fm = out`. If it is always `None`:
+- ZED depth map is not returning valid values at the far row
+- Try switching `CAM_DEPTH_MODE` from `PERFORMANCE` to `NEURAL` in config
+- Or reduce `CTRL_LOOKAHEAD_M` to 1.8 (ZED is more reliable at shorter range)
+
+---
+
+## 6. Live Testing — Step by Step
+
+### Phase 1 — Straight line (first drive)
+
+Start with the most conservative settings:
+```python
+CTRL_LANE_DEADBAND_M = 0.20   # very relaxed
+STEER_EMA_ALPHA      = 0.15   # smooth
+STEER_RATE_LIMIT_DEG = 4.0    # gentle
+SPEED_TARGET_STRAIGHT_KMH = 3.0
+```
+
+Drive a straight section. Expected: servo is quiet, car holds a comfortable straight line.
 
 | What you see | Cause | Fix |
 |---|---|---|
-| Car weaves left-right constantly | Deadband too small | `STEER_DEADBAND_DEG` 3 → 5 |
-| Car drifts slowly to one side and stays | Camera not aligned or polynomial bias | Check camera mount is centered on vehicle axis |
-| Car corrects but overshoots, oscillates | `STEER_RATE_DEG` too high | Lower to 5° |
-| Car barely corrects, drifts far | `STEER_RATE_DEG` too low or EMA too slow | Raise to 12°, raise alpha to 0.20 |
+| Servo constantly active, small left-right movements | Deadband too tight | `CTRL_LANE_DEADBAND_M` 0.20 → 0.25 |
+| Car slowly drifts to one side and stays | Camera off-center OR wrong steer sign | Check camera alignment; verify Step 2 sign test |
+| Car oscillates left-right (weaving) | EMA too fast or rate limit too high | `STEER_EMA_ALPHA` ↓ to 0.12, `STEER_RATE_LIMIT_DEG` ↓ to 3.0 |
+| Car barely corrects when drifting to edge | Deadband too wide | `CTRL_LANE_DEADBAND_M` ↓ to 0.12 |
+| Sudden servo jolt, then normal | Bad Segformer frame getting through | `STEER_RATE_LIMIT_DEG` ↓ to 3.0 |
 
----
+### Phase 2 — Curves
 
-### Step 2: Tune lookahead for curves
-
-Drive through a known curve at your target speed.
+Once straights are stable, approach a curve.
 
 | What you see | Cause | Fix |
 |---|---|---|
-| Car cuts inside the curve | Lookahead too short, over-steering | `CTRL_LOOKAHEAD_M` ↑ (2.2 → 2.8) |
-| Car runs wide, exits the curve late | Lookahead too long, under-steering | `CTRL_LOOKAHEAD_M` ↓ (2.2 → 1.8) |
-| Car oscillates through the curve | `STEER_RATE_DEG` too high | Lower to 6° |
-| Car takes wide smooth arc, barely corrects | Heading term working, lateral correction weak | Lower `CTRL_LATERAL_DEADBAND_FRAC` (0.085 → 0.06) |
+| Car takes curve smoothly, stays in lane | Good — done | — |
+| Car runs wide (exits on outside) | Lookahead too long, reacts too late | `CTRL_LOOKAHEAD_M` ↓ (2.2 → 1.8) |
+| Car cuts inside the curve | Lookahead too short, over-corrects | `CTRL_LOOKAHEAD_M` ↑ (2.2 → 2.6) |
+| Car oscillates through the curve | Rate limit or EMA too aggressive | `STEER_RATE_LIMIT_DEG` ↓ to 3.5, `STEER_EMA_ALPHA` ↓ to 0.15 |
+| Car starts turning too late | EMA lag building up | `STEER_EMA_ALPHA` ↑ to 0.25 |
+| Car can't complete sharp turn | Angle clamped at 25° — servo at limit | Verify servo can physically reach needed angle. Reduce speed into turn. |
 
----
+### Phase 3 — Tighten or relax
 
-### Step 3: Tune responsiveness
+Once stable on both straights and curves, adjust to your preferred balance:
 
-`STEER_RATE_DEG` and `STEER_EMA_ALPHA` control how fast and aggressively the car responds.
-
+**Relaxed (SEM race — eco focus, minimal servo activity):**
+```python
+CTRL_LANE_DEADBAND_M  = 0.18
+STEER_EMA_ALPHA       = 0.15
+STEER_RATE_LIMIT_DEG  = 4.0
+STEER_TX_DEADBAND_DEG = 2.0
 ```
-Slow, smooth, stable   ←──────────────────→   Fast, reactive, risky of oscillation
-STEER_RATE_DEG:  5°                                                          15°
-STEER_EMA_ALPHA: 0.07                                                        0.35
+
+**Balanced (default — good for most tracks):**
+```python
+CTRL_LANE_DEADBAND_M  = 0.15
+STEER_EMA_ALPHA       = 0.20
+STEER_RATE_LIMIT_DEG  = 5.0
+STEER_TX_DEADBAND_DEG = 1.5
 ```
 
-- Start at `STEER_RATE_DEG = 8`, `STEER_EMA_ALPHA = 0.10`
-- If too sluggish: raise both — `STEER_RATE_DEG = 12`, `STEER_EMA_ALPHA = 0.20`
-- If oscillating: lower both — `STEER_RATE_DEG = 5`, `STEER_EMA_ALPHA = 0.07`
+**Tighter (if you want more active centering):**
+```python
+CTRL_LANE_DEADBAND_M  = 0.08
+STEER_EMA_ALPHA       = 0.25
+STEER_RATE_LIMIT_DEG  = 6.0
+STEER_TX_DEADBAND_DEG = 1.0
+```
 
 ---
 
-### Step 4: Increase speed
+## 7. Quick Symptom → Fix Table
 
-Once stable at 3 km/h, push the speed up in 1–2 km/h steps.
-
-At each new speed:
-1. If curves feel late and wide → reduce `CTRL_LOOKAHEAD_M` by 0.2m
-2. If oscillation increases → lower `STEER_EMA_ALPHA` slightly
-3. Differentiate speeds: set `SPEED_TARGET_STRAIGHT_KMH` higher, keep `SPEED_TARGET_CURVE_KMH` at 3.0
-
----
-
-## 8. Quick Reference — Symptom to Fix
-
-| Symptom | Most Likely Cause | Parameter |
+| Symptom | Most Likely Cause | Fix |
 |---|---|---|
-| Weaves on straights | Deadband too small | `STEER_DEADBAND_DEG` ↑ |
-| Drifts to one side permanently | Camera misalignment | Check mount |
-| Slow to correct lateral drift | EMA too slow or rate too low | `STEER_EMA_ALPHA` ↑, `STEER_RATE_DEG` ↑ |
-| Cuts inside every curve | Lookahead too short | `CTRL_LOOKAHEAD_M` ↑ |
+| Servo always quiet, car drifts to edge | Deadband too wide | `CTRL_LANE_DEADBAND_M` ↓ |
+| Servo constantly active on straight | Deadband too tight | `CTRL_LANE_DEADBAND_M` ↑ |
+| Car drifts permanently to one side | Wrong steer sign or camera off-center | Re-run Step 2 sign test; check mount |
 | Runs wide on every curve | Lookahead too long | `CTRL_LOOKAHEAD_M` ↓ |
-| Jerky/twitchy on curves | Rate too high | `STEER_RATE_DEG` ↓ |
-| Barely steers into curves | Rate too low | `STEER_RATE_DEG` ↑ |
-| Oscillates and overshoots | EMA too fast | `STEER_EMA_ALPHA` ↓ |
-| Steering lags behind road | EMA too slow | `STEER_EMA_ALPHA` ↑ |
-| Polynomial unstable far rows | Fit zone too wide | `SEG_FIT_TOP_FRAC` ↑ (0.72 → 0.80) |
-| Jitters at standstill | TX deadband too small | `STEER_TX_DEADBAND_DEG` ↑ |
+| Cuts inside every curve | Lookahead too short | `CTRL_LOOKAHEAD_M` ↑ |
+| Oscillates left-right on straight | EMA too fast | `STEER_EMA_ALPHA` ↓ |
+| Slow to enter curves | EMA too slow | `STEER_EMA_ALPHA` ↑ |
+| Sudden single jolt then normal | Bad Segformer frame | `STEER_RATE_LIMIT_DEG` ↓ |
+| Steering computed but nothing sent to servo | TX deadband too wide | `STEER_TX_DEADBAND_DEG` ↓ |
+| Steer always 0° even far off-center | lookahead_point always None | See Step 4 checklist |
+| Over-steer on all curves systematically | Wheelbase too small | Measure and update `WHEELBASE_M` |
+| Under-steer on all curves systematically | Wheelbase too large | Measure and update `WHEELBASE_M` |
+| FPS drops on straights | `PC_REFRESH_EVERY` too low | Raise to 6 or 8 |
+
+---
+
+## 8. Telemetry — Reading the Logs
+
+With `LOG_TELEMETRY = True`, each run writes a `.jsonl` file to `logs/`. Each line is one frame:
+
+```json
+{
+  "t": 1.234,         // time since start (seconds)
+  "f": 37,            // frame number
+  "dev": 0.032,       // lateral deviation in metres (near point)
+  "conf": 0.87,       // Segformer confidence (0–1)
+  "src": "SEGFORMER", // detection source
+  "head": 0.021,      // heading angle (radians)
+  "curv": 0.004,      // road curvature (m⁻¹)
+  "steer_deg": 3.2,   // steering angle sent (degrees)
+  "speed_kmh": 3.0,   // measured vehicle speed
+  "target_kmh": 3.0,  // commanded speed
+  "stop_line": false,
+  "sl_dist": 0.0,
+  "stop_sign": false,
+  "ss_dist": 0.0,
+  "cmd": "RUN"
+}
+```
+
+**What to look for after a test run:**
+
+- `steer_deg` on straights — should be near 0 most of the time. If frequently ±3–8° you have oscillation.
+- `conf` — should be > 0.5 on clean road. Frequent drops below 0.3 = Segformer struggling with lighting/surface.
+- `src` — `LOST` events during driving = road detection failures. Count them.
+- `dev` — the lateral error trend. Steady drift in one direction = camera alignment issue.
+- `cmd` — `BRAKE` should only appear near stop-line/stop-sign. Unexpected `BRAKE` = false positive detection.
+
+---
+
+## 9. Profiling — Checking FPS
+
+With `PROFILE_ENABLED = True`, every 30 frames the console prints timing per stage:
+
+```
+[Profile] avg over 30 frames  (total=47.3 ms → 21.1 fps est.)
+  segformer_lane         31.2 ms   ← Segformer inference (background thread, doesn't block)
+  grab+retrieve          10.4 ms   ← Camera grab + depth retrieval
+  stop_line               3.1 ms
+  sign_detect             1.8 ms
+  control                 0.8 ms
+```
+
+If total is above 50ms (< 20 fps):
+- Increase `SEG_SKIP_STRAIGHT` to 2 or 3 — Segformer runs less often on straights
+- Increase `PC_REFRESH_EVERY` to 6 — depth retrieved less often
+- Switch `CAM_DEPTH_MODE` to `PERFORMANCE` (already default)
+
+---
+
+## 10. Fallback Path
+
+When the ZED depth map has no valid pixels in the patch around the far-row centerline, `compute_lookahead()` returns `None`. The controller falls back to:
+
+```python
+dev = result.deviation_m          # lateral offset at near point (~1m ahead)
+raw_rad = atan2(2×L×dev, ld²)    # same formula, assumed depth for ld
+```
+
+This is less accurate geometrically but keeps the car correcting. The lane deadband applies here too.
+
+**If fallback triggers often** (you see `lookahead_point` is frequently `None`):
+- ZED depth is unreliable at the far row distance
+- Lower `CTRL_LOOKAHEAD_M` to 1.8m — depth is better at shorter range
+- Or switch to `CAM_DEPTH_MODE = sl.DEPTH_MODE.NEURAL` for better depth quality
 
 ---
 

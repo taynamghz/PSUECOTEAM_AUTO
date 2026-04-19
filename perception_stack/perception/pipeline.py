@@ -50,7 +50,8 @@ class LanePerception:
         self.ctrl_smoother = ControlSmoother()
 
         self.image_mat = sl.Mat()
-        self.pc_mat    = sl.Mat()
+        self.pc_mat    = sl.Mat()   # full XYZ — only for stop-line/sign distance
+        self.depth_mat = sl.Mat()   # single-channel Z — for steering lookahead
         self.runtime   = sl.RuntimeParameters()
 
         self.cal = None
@@ -80,9 +81,13 @@ class LanePerception:
         self._clahe = cv2.createCLAHE(
             clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_SIZE)
 
-        # Point-cloud cache (retrieved on demand, not every frame)
+        # Depth cache (single-channel Z) — refreshed every PC_REFRESH_EVERY frames.
+        # Used by compute_lookahead for accurate steering: 3.7 MB vs 11 MB for XYZ.
+        self._depth_cache: Optional[np.ndarray] = None
+        self._depth_age:   int                  = PC_REFRESH_EVERY  # force fetch frame 1
+
+        # Full XYZ cache — only retrieved when stop-line/sign detection is active.
         self._pc_cache: Optional[np.ndarray] = None
-        self._pc_age:   int                  = PC_REFRESH_EVERY  # force fetch frame 1
 
         # Rolling frame-time buffer for FPS monitoring
         self._frame_times: collections.deque = collections.deque(maxlen=30)
@@ -166,10 +171,19 @@ class LanePerception:
         frame      = self.image_mat.get_data()[:, :, :3].copy()
         frame_norm = self._apply_clahe(frame)
 
-        # ── Point-cloud retrieval (on-demand) ─────────────────────────────────
-        # Only fetch when a detection vote is active or cache is empty.
-        # At 15 km/h the car moves ~0.14 m/frame — stale ≤4 frames is acceptable.
-        self._pc_age += 1
+        # ── Depth retrieval (single-channel Z, for steering) ──────────────────
+        # MEASURE.DEPTH = Z only = 3.7 MB vs 11 MB for full XYZ.
+        # Refreshed every PC_REFRESH_EVERY frames. Cached between refreshes.
+        # compute_lookahead uses real ZED Z (handles slopes/tilts) + pinhole X.
+        self._depth_age += 1
+        if self._depth_cache is None or self._depth_age >= PC_REFRESH_EVERY:
+            self.cam.retrieve_measure(self.depth_mat, sl.MEASURE.DEPTH)
+            raw = self.depth_mat.get_data()
+            self._depth_cache = raw.squeeze().copy()   # (H, W) float32
+            self._depth_age   = 0
+
+        # ── Full XYZ point-cloud (for stop-line/sign distance only) ───────────
+        # Only retrieved when a detection vote is accumulating — rare during race.
         sign_active = self.sign_detector.get_result()[0]
         need_pc = (
             self._pc_cache is None
@@ -286,7 +300,8 @@ class LanePerception:
                 self._last_curvature = k_sm
             heading_sm = self._last_heading
             curv_sm    = self._last_curvature
-            lookahead_world, lookahead_px = compute_lookahead(lf, rf, pc, self.H, self.W)
+            lookahead_world, lookahead_px = compute_lookahead(
+                lf, rf, self.H, self.W, self.cal.fx, self._depth_cache)
 
             if PROFILE_ENABLED: t = self._tick("control", t)
 
