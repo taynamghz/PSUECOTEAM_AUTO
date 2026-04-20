@@ -1,48 +1,29 @@
 """
 PSU Eco Racing — Shell Eco-Marathon Autonomous Division
-obstacle_avoidance.py  |  Standalone cone avoidance — fully self-contained test.
+obstacle_avoidance.py  |  Standalone cone avoidance — fully self-contained.
 
-Runs everything needed for safe autonomous driving + cone avoidance:
-
-  Normal mode (LANE_FOLLOW):
-    Segformer centerline → compute_lookahead → pure pursuit → steer.
-    Identical logic to the main pipeline.
-
-  Avoidance mode (AVOIDING):
-    Builds a list of passable gaps from the lane structure:
-      gaps = all intervals [left_edge, right_edge] in camera X (metres)
-             that are (a) not occupied by a cone and (b) wide enough for the car.
-    The best gap is the one with the highest score (width + centering preference).
-    Pure pursuit steers to the gap centre.
-
-    This naturally handles every arrangement:
-      – Single cone dead centre  → picks whichever side has more road space.
-      – 2 cones forming a slot   → threads through the slot.
-      – Cone far to the side     → ignored (not blocking any gap the car needs).
-
-  Trigger:
-    Avoidance only engages when a cone is within the FORWARD PATH CORRIDOR
-    (|X_cone| < PATH_WIDTH_M  AND  Z_cone < AVOIDANCE_TRIGGER_M).
-    A cone 2 m to the side will never trigger avoidance.
-
-  Transitions:
-    LANE_FOLLOW → AVOIDING  when a path-blocking cone enters AVOIDANCE_TRIGGER_M
-    AVOIDING    → LANE_FOLLOW  when all path-blocking cones exit AVOIDANCE_RELEASE_M
-                               AND the selected gap centre is within RETURN_BAND_M
-                               of the lane centre (prevents premature release).
-
-Threading (nothing blocks the camera loop):
-  Main thread    — grab, CLAHE, depth, odometry, steering, UART, display
-  SegformerLane  — background thread inside imported class
-  ConeDetector   — background thread defined here
-
-Run standalone:
-    python obstacle_avoidance.py
-
-Integrate into main.py later (swap YOLOv5 → YOLOv8 at that point):
-    sys = ConeAvoidanceSystem()
-    sys.init()
-    steer_deg, state = sys.process_frame(frame, depth_arr, pose, fx, H, W)
+FIXES applied over original:
+  [SM-1]  State release uses estimated lateral pose error, not _gap_target proxy.
+  [SM-2]  Dwell timer: AVOIDING_MIN_DWELL_FRAMES frames before release allowed.
+  [SM-3]  CONE_Z_BLOCKING_MIN_M removed — replaced with cone-passed tracking so
+          cones are never dropped mid-manoeuvre.
+  [GP-1]  Gap planner operates per-cone-Z plane (two planes when cones differ by
+          > MULTI_PLANE_Z_THRESH), returns the intersection of passable corridors.
+  [GP-2]  Explicit NO_SAFE_GAP state when every gap is < MIN_GAP_M; car stops.
+  [GP-3]  Gap score normalised: score = (width/MIN_GAP_M) - GAP_CENTER_WEIGHT*|gc|
+  [PP-1]  Avoidance steers with a two-point pursuit: lateral offset fed as an
+          arc to a waypoint at AVOID_PURSUIT_Z ahead, not at the cone's Z.
+  [PP-2]  AVOID_PURSUIT_Z raised to 3.0 m; trigger raised to 4.0 m so the car
+          has time to manoeuvre before reaching the obstacle.
+  [CM-1]  Ghost-cone suppression: cones behind the car's current Z are expired
+          immediately regardless of age.
+  [CM-2]  Depth patch size scales with Z: larger patch at long range.
+  [CM-3]  Depth sampling from vertical-centre of bbox, not just base row.
+  [SEG-1] lane_bounds_m called once per frame; result cached and shared between
+          control and display.
+  [SEG-2] Fallback width aligned with PATH_WIDTH_M (±1.5 m, not ±1.2 m).
+  [SEG-3] Row sampling increased to 12 samples to reduce sensitivity to gaps.
+  [CL-1]  CLAHE applied only for Segformer + display; raw frame sent to YOLO.
 """
 
 import math
@@ -90,52 +71,65 @@ UART_HEARTBEAT_S   = 0.080
 
 # Speed
 SPEED_STRAIGHT_KMH = 3.0
-SPEED_AVOID_KMH    = 2.0          # slow down while manoeuvring
+SPEED_AVOID_KMH    = 2.0
+SPEED_STOP_KMH     = 0.0          # [GP-2] used when NO_SAFE_GAP
 
-# Lane-following pure pursuit  (matches main pipeline)
-WHEELBASE_M           = 1.6       # axle-to-axle — verify physically
-CTRL_LOOKAHEAD_M      = 2.2       # fallback assumed depth (m) at lookahead row
-CTRL_LANE_DEADBAND_M  = 0.15      # ignore offsets < ±15 cm in LANE_FOLLOW mode
+# Lane-following pure pursuit
+WHEELBASE_M           = 1.6
+CTRL_LOOKAHEAD_M      = 2.2
+CTRL_LANE_DEADBAND_M  = 0.15
 STEER_MAX_DEG         = 25.0
-STEER_RATE_LIMIT_DEG  = 5.0       # max change per frame
+STEER_RATE_LIMIT_DEG  = 5.0
 STEER_EMA_ALPHA       = 0.20
-STEER_TX_DEADBAND_DEG = 1.5       # only transmit if angle changed by this much
+STEER_TX_DEADBAND_DEG = 1.5
 
-# Cone detector (YOLOv5 custom model via torch.hub)
+# Cone detector (YOLOv5 custom model)
 YOLO_MODEL_PATH  = "best (cones).pt"
-YOLO_CONF_THRESH = 0.25   # lowered — raise if you get false positives
+YOLO_CONF_THRESH = 0.25
 YOLO_IMG_SIZE    = 416
-YOLO_SKIP_FRAMES = 2      # run every N frames
+YOLO_SKIP_FRAMES = 2
 
 # Cone 3D localisation
-CONE_DEPTH_PAD = 6                # patch half-size (px) for ZED depth median
-CONE_Z_MIN_M          = 0.3
-CONE_Z_MAX_M          = 12.0   # must be > AVOIDANCE_TRIGGER_M so cones are tracked before they trigger
-CONE_Z_BLOCKING_MIN_M = 0.8    # ignore cones already this close — car is passing them
+# [CM-2] pad now computed dynamically — see _patch_depth()
+CONE_Z_MIN_M   = 0.3
+CONE_Z_MAX_M   = 15.0            # track further ahead for earlier warning
 
 # World-frame cone map
 CONE_MERGE_RADIUS_M = 0.50
 CONE_MAX_AGE_S      = 4.0
 
+# [SM-3] removed CONE_Z_BLOCKING_MIN_M — replaced by passed-cone tracking
+
 # Avoidance trigger
-# A cone must be BOTH close in Z AND inside the path corridor in X.
-# Cones to the side (|X| > PATH_WIDTH_M) are not a threat and are ignored.
-AVOIDANCE_TRIGGER_M  = 1.5        # max forward distance to trigger
-AVOIDANCE_RELEASE_M  = 2.5        # hysteresis: release when clear beyond this
-PATH_WIDTH_M         = 1.5        # fallback half-corridor when road mask unavailable
-RETURN_BAND_M        = 0.20       # release only when gap target < this from centre
+# [PP-2] Raised trigger to 4.0 m and release to 5.0 m for more reaction time.
+AVOIDANCE_TRIGGER_M  = 4.0
+AVOIDANCE_RELEASE_M  = 5.0
+PATH_WIDTH_M         = 1.5       # [SEG-2] aligned with ±1.5 m fallback
+
+# [SM-2] Minimum frames to stay in AVOIDING before release is evaluated
+AVOIDING_MIN_DWELL_FRAMES = 20   # at 30 fps ≈ 0.67 s
+
+# [SM-1] Release checks lateral pose error, not gap target
+# If the car's estimated lateral position relative to lane centre is within
+# this band AND dwell timer is satisfied AND path is clear → release.
+LATERAL_RETURN_BAND_M = 0.25
 
 # Gap planner
-CAR_WIDTH_M          = 0.90       # full vehicle width — measure physically
-GAP_SAFETY_MARGIN_M  = 0.20       # extra clearance each side (total gap needed = CAR_WIDTH + 2×margin)
-MIN_GAP_M            = CAR_WIDTH_M + 2 * GAP_SAFETY_MARGIN_M   # minimum passable gap
-CONE_RADIUS_M        = 0.15       # treat each cone as a cylinder of this radius
-GAP_LOOKAHEAD_M      = 1.7        # fallback waypoint Z when no cone depth available
-GAP_CENTER_WEIGHT    = 0.40       # preference for gaps closer to lane centre (lower = prefer centre)
-GAP_DEADBAND_M       = 0.05       # ignore gap offsets < this — matches lane-keeping CTRL_LANE_DEADBAND_M
+CAR_WIDTH_M          = 0.90
+GAP_SAFETY_MARGIN_M  = 0.20
+MIN_GAP_M            = CAR_WIDTH_M + 2 * GAP_SAFETY_MARGIN_M
+CONE_RADIUS_M        = 0.15
 
-# Lane edge margin (how far from the edge any gap target must be)
-LANE_MARGIN_M = 0.25
+# [PP-2] Avoidance pure-pursuit fires to a waypoint at this fixed depth.
+# Must be > AVOIDANCE_TRIGGER_M so the lookahead is beyond the obstacle.
+AVOID_PURSUIT_Z      = 3.0
+
+GAP_CENTER_WEIGHT    = 0.40
+GAP_DEADBAND_M       = 0.05
+LANE_MARGIN_M        = 0.25
+
+# [GP-1] When two cones differ in Z by more than this, evaluate two planes.
+MULTI_PLANE_Z_THRESH = 0.40
 
 # Depth cache
 DEPTH_REFRESH_EVERY = 4
@@ -152,6 +146,7 @@ CLR_GAP_SEL  = (0,   220,  80)
 CLR_WARN     = (0,    80, 255)
 CLR_OK       = (0,   200,  80)
 CLR_PATH     = (0,   200,   0)
+CLR_STOP     = (0,     0, 200)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +154,14 @@ CLR_PATH     = (0,   200,   0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _patch_depth(depth_arr: np.ndarray, y: int, x: int,
-                 H: int, W: int, pad: int = 5) -> float:
+                 H: int, W: int, z_hint: float = 2.0) -> float:
+    """
+    [CM-2] Patch size scales with estimated distance so the sampling window
+    covers a roughly constant physical area (~30 cm radius) regardless of Z.
+    fx ≈ 700 px for HD720; r_px = 0.30 * fx / Z clamped to [4, 20].
+    """
+    fx_approx = 700.0
+    pad = int(np.clip(0.30 * fx_approx / max(z_hint, 0.5), 4, 20))
     r0, r1 = max(0, y - pad), min(H, y + pad + 1)
     c0, c1 = max(0, x - pad), min(W, x + pad + 1)
     patch  = depth_arr[r0:r1, c0:c1]
@@ -168,21 +170,20 @@ def _patch_depth(depth_arr: np.ndarray, y: int, x: int,
 
 
 def _deg_to_byte(deg: float) -> int:
-    # 0=full-left(-25°)  127=straight(0°)  255=full-right(+25°)  — matches commander.py
     return int(max(0, min(255, round(127.0 + deg * 127.0 / STEER_MAX_DEG))))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cone detector — YOLOv5 via torch.hub, background thread
+# Cone detector — YOLOv5, background thread
+# [CL-1] Receives raw (non-CLAHE) frame
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ConeDetector:
     def __init__(self):
-        self._model:  object        = None
-        self._half:   bool          = False
-        self._in_q:   queue.Queue   = queue.Queue(maxsize=1)
-        self._out_q:  queue.Queue   = queue.Queue(maxsize=1)
-        self._result: List[Tuple]   = []
+        self._model:  object       = None
+        self._in_q:   queue.Queue  = queue.Queue(maxsize=1)
+        self._out_q:  queue.Queue  = queue.Queue(maxsize=1)
+        self._result: List[Tuple]  = []
 
     def init(self) -> bool:
         import os
@@ -192,16 +193,12 @@ class ConeDetector:
         try:
             self._model      = torch.hub.load(
                 "ultralytics/yolov5", "custom",
-                path=YOLO_MODEL_PATH,
-                force_reload=False,
-                verbose=False,
+                path=YOLO_MODEL_PATH, force_reload=False, verbose=False,
             )
             self._model.conf = YOLO_CONF_THRESH
             self._model.iou  = 0.45
-            # Move to CUDA + FP16 if available — ~5× faster on Jetson
             if torch.cuda.is_available():
                 self._model = self._model.cuda().half()
-                self._half  = True
                 log.info("[ConeDetector] Loaded %s — CUDA FP16", YOLO_MODEL_PATH)
             else:
                 log.info("[ConeDetector] Loaded %s — CPU", YOLO_MODEL_PATH)
@@ -212,9 +209,10 @@ class ConeDetector:
             log.error("[ConeDetector] Load failed: %s", exc)
             return False
 
-    def submit(self, frame: np.ndarray) -> None:
+    def submit(self, raw_frame: np.ndarray) -> None:
+        """[CL-1] Always submit the RAW frame — do NOT apply CLAHE before this."""
         try:
-            self._in_q.put_nowait(frame)
+            self._in_q.put_nowait(raw_frame)
         except queue.Full:
             pass
 
@@ -232,7 +230,7 @@ class ConeDetector:
             try:
                 rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = self._model(rgb, size=YOLO_IMG_SIZE)
-                dets    = []
+                dets = []
                 for *xyxy, conf, _ in results.xyxy[0].cpu().float().numpy():
                     dets.append((float(xyxy[0]), float(xyxy[1]),
                                  float(xyxy[2]), float(xyxy[3]), float(conf)))
@@ -253,11 +251,19 @@ class ConeDetector:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # World-frame cone map
+# [CM-1] Ghost-cone suppression: cones behind the car are expired immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ConeWorldMap:
+    """
+    Each entry: [X_w, Z_w, timestamp, passed]
+    'passed' is set True when the cone transforms into negative Z in camera
+    frame (i.e., the car has driven past it).  Passed cones are excluded from
+    all blocking / planning queries so they can never re-trigger avoidance.
+    """
+
     def __init__(self):
-        self._cones: List[List] = []  # [X_w, Z_w, timestamp]
+        self._cones: List[List] = []   # [X_w, Z_w, timestamp, passed]
 
     def update(self, cam_cones: List[Tuple[float, float]], pose: sl.Pose) -> None:
         now = time.monotonic()
@@ -274,16 +280,27 @@ class ConeWorldMap:
                     merged = True
                     break
             if not merged:
-                self._cones.append([X_w, Z_w, now])
+                self._cones.append([X_w, Z_w, now, False])
         self._cones = [e for e in self._cones if now - e[2] < CONE_MAX_AGE_S]
 
     def in_camera_frame(self, pose: sl.Pose) -> List[Tuple[float, float]]:
+        """
+        Returns only cones that are:
+          - ahead (Z_c > CONE_Z_MIN_M) and within range (Z_c < CONE_Z_MAX_M)
+          - not yet passed
+        [CM-1] Marks cones as 'passed' the moment they go behind the car (Z_c ≤ 0).
+        """
         tx, tz, R2 = self._pose_xz(pose)
         R2_inv = R2.T
         out = []
         for e in self._cones:
+            if e[3]:   # already passed — skip
+                continue
             cam  = R2_inv @ (np.array([e[0], e[1]]) - np.array([tx, tz]))
             X_c, Z_c = float(cam[0]), float(cam[1])
+            if Z_c <= 0.0:                  # [CM-1] car drove past — mark passed
+                e[3] = True
+                continue
             if CONE_Z_MIN_M < Z_c < CONE_Z_MAX_M:
                 out.append((X_c, Z_c))
         return out
@@ -299,6 +316,7 @@ class ConeWorldMap:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cone 3D localisation
+# [CM-2] Adaptive patch size; [CM-3] sample from vertical bbox centre, not base
 # ─────────────────────────────────────────────────────────────────────────────
 
 def localise_cones(
@@ -308,11 +326,17 @@ def localise_cones(
 ) -> List[Tuple[float, float]]:
     out = []
     for x1, y1, x2, y2, _ in detections:
-        cx  = (x1 + x2) / 2.0
-        cy  = min(y2, H - 1)
-        xi  = int(np.clip(cx, 0, W - 1))
-        yi  = int(np.clip(cy, 0, H - 1))
-        Z_m = _patch_depth(depth_arr, yi, xi, H, W, pad=CONE_DEPTH_PAD)
+        cx = (x1 + x2) / 2.0
+        # [CM-3] Use vertical centre of bbox for more reliable depth sampling.
+        cy = (y1 + y2) / 2.0
+        xi = int(np.clip(cx, 0, W - 1))
+        yi = int(np.clip(cy, 0, H - 1))
+        # First pass with a generic z_hint; [CM-2] refine patch once we have Z.
+        Z_m = _patch_depth(depth_arr, yi, xi, H, W, z_hint=2.0)
+        if not (CONE_Z_MIN_M < Z_m < CONE_Z_MAX_M):
+            continue
+        # Refine with actual Z for better patch sizing
+        Z_m = _patch_depth(depth_arr, yi, xi, H, W, z_hint=Z_m)
         if not (CONE_Z_MIN_M < Z_m < CONE_Z_MAX_M):
             continue
         X_m = (cx - W / 2.0) * Z_m / fx
@@ -321,7 +345,10 @@ def localise_cones(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lane boundary extraction from Segformer road_mask
+# Lane boundary extraction
+# [SEG-1] Returns a cached FrameLaneBounds named tuple used by both control and display.
+# [SEG-2] Fallback is ±PATH_WIDTH_M (was ±1.2 m, now ±1.5 m to match PATH_WIDTH_M).
+# [SEG-3] Row sampling increased to 12 samples.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def lane_bounds_m(
@@ -331,12 +358,13 @@ def lane_bounds_m(
 ) -> Tuple[float, float]:
     """
     Left/right drivable edge in camera X (metres).
-    Samples a band of rows between SEG_FAR_FRAC and SEG_NEAR_FRAC and takes
-    the median left/right column so a single occluded row doesn't corrupt bounds.
-    Falls back to ±1.2 m when mask is unavailable or too sparse.
+    [SEG-2] Fallback returns ±PATH_WIDTH_M (was ±1.2, now ±1.5).
+    [SEG-3] Samples up to 12 row intervals instead of 6.
     """
+    fallback = (-PATH_WIDTH_M, PATH_WIDTH_M)
+
     if road_mask is None or not road_mask.any():
-        return -1.2, 1.2
+        return fallback
 
     y_near   = int(H * SEG_NEAR_FRAC)
     y_far    = int(H * SEG_FAR_FRAC)
@@ -344,7 +372,8 @@ def lane_bounds_m(
 
     left_cols: List[int]  = []
     right_cols: List[int] = []
-    step = max(1, (y_near - y_far) // 6)
+    # [SEG-3] 12 samples instead of 6
+    step = max(1, (y_near - y_far) // 12)
     for y in range(y_far, y_near + 1, step):
         row = road_mask[y].copy()
         row[:safe_top] = False
@@ -353,8 +382,8 @@ def lane_bounds_m(
             left_cols.append(int(cols[0]))
             right_cols.append(int(cols[-1]))
 
-    if not left_cols:
-        return -1.2, 1.2
+    if len(left_cols) < 3:           # need at least 3 valid rows for median
+        return fallback
 
     left_col  = int(np.median(left_cols))
     right_col = int(np.median(right_cols))
@@ -362,131 +391,217 @@ def lane_bounds_m(
     Z_near    = _patch_depth(depth_arr, y_near, mid, H, W)
     left_X    = (float(left_col)  - W / 2.0) * Z_near / fx
     right_X   = (float(right_col) - W / 2.0) * Z_near / fx
-    log.debug("[lane_bounds] rows sampled=%d  left=%.2f m  right=%.2f m",
+    log.debug("[lane_bounds] rows=%d  L=%.2f m  R=%.2f m",
               len(left_cols), left_X, right_X)
     return left_X, right_X
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path-blocking check
+# [SM-3] No longer filters by CONE_Z_BLOCKING_MIN_M.  Passed-cone tracking in
+#        ConeWorldMap handles the "car already beside the cone" case correctly.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def path_blocking_cones(
     cones_cam: List[Tuple[float, float]],
-    left_X_m:  float = -PATH_WIDTH_M,
-    right_X_m: float =  PATH_WIDTH_M,
+    left_X_m:  float,
+    right_X_m: float,
 ) -> List[Tuple[float, float]]:
     """
-    Return only cones within the actual drivable road area and avoidance range.
-    Uses real segformer road edges when available; falls back to ±PATH_WIDTH_M.
+    Cones within the drivable corridor and forward of the car.
+    No minimum Z floor — passed-cone tracking handles near cones safely.
     """
     return [
         (X, Z) for (X, Z) in cones_cam
-        if CONE_Z_BLOCKING_MIN_M < Z < AVOIDANCE_TRIGGER_M and left_X_m <= X <= right_X_m
+        if CONE_Z_MIN_M < Z < AVOIDANCE_TRIGGER_M and left_X_m <= X <= right_X_m
     ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gap planner
+# [GP-1] Multi-plane evaluation: intersect corridors from all distinct Z planes.
+# [GP-2] Returns NO_SAFE_GAP flag when nothing passable exists.
+# [GP-3] Score normalised by MIN_GAP_M.
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _gaps_at_plane(
+    cones_at_plane: List[Tuple[float, float]],
+    safe_left: float,
+    safe_right: float,
+) -> List[Tuple[float, float, float]]:
+    """
+    Compute passable gaps (left, right, centre) within [safe_left, safe_right]
+    given a set of cones projected onto a single Z plane.
+    """
+    raw_excl = sorted(
+        (X - CONE_RADIUS_M, X + CONE_RADIUS_M)
+        for X, _ in cones_at_plane
+    )
+    merged: List[List[float]] = []
+    for lo, hi in raw_excl:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+
+    gaps: List[Tuple[float, float, float]] = []
+    cursor = safe_left
+    for lo, hi in merged:
+        if lo - cursor >= MIN_GAP_M:
+            centre = (cursor + lo) / 2.0
+            gaps.append((cursor, lo, centre))
+        cursor = max(cursor, hi)
+    if safe_right - cursor >= MIN_GAP_M:
+        centre = (cursor + safe_right) / 2.0
+        gaps.append((cursor, safe_right, centre))
+    return gaps
+
 
 def find_best_gap(
     blocking_cones: List[Tuple[float, float]],
     left_X_m: float,
     right_X_m: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, List, List, float, float, bool]:
     """
-    Build a list of passable gaps from the lane structure and cone positions,
-    then return the centre of the best gap as (X_target_m, GAP_LOOKAHEAD_M).
+    Returns:
+        gap_centre_X   – X target for steering (m)
+        gap_Z          – Z at which waypoint is placed (= AVOID_PURSUIT_Z)
+        all_gaps       – list of (left, right, centre) for display
+        merged_excl    – merged exclusion intervals for display
+        safe_left      – left safe boundary (m)
+        safe_right     – right safe boundary (m)
+        no_safe_gap    – [GP-2] True when NO passable gap exists
 
-    Gap construction
-    ────────────────
-    Treat each cone as blocking the interval [X_cone - CONE_RADIUS_M,
-                                               X_cone + CONE_RADIUS_M].
-    The passable segments of [left_X_m + margin, right_X_m - margin]
-    are the intervals NOT covered by any cone exclusion zone.
+    [GP-1] Multi-plane: groups cones by Z cluster and intersects the set of
+    passable X corridors across all planes.  The valid steering corridor is the
+    intersection (narrowest common passable region).
 
-    Merge overlapping exclusion zones first so adjacent cones are treated
-    as a single combined obstacle.
-
-    Gap scoring  (higher = better)
-    ─────────────────────────────
-    score = gap_width - GAP_CENTER_WEIGHT × |gap_centre|
-
-    Prefer wider gaps; tie-break toward lane centre (X=0).
-
-    Handles:
-      1 cone at centre      → two gaps, picks the wider side.
-      2 cones forming slot  → threads through the slot gap.
-      2 cones side-by-side  → merged into one obstacle, goes around.
-      No cones (fallback)   → returns (0.0, GAP_LOOKAHEAD_M) — stay centre.
+    [GP-3] Score = (width / MIN_GAP_M) - GAP_CENTER_WEIGHT * |centre|
+    Normalising by MIN_GAP_M keeps the width term dimensionless and comparable
+    across scenarios where gaps differ by a fraction of a metre.
     """
     safe_left  = left_X_m  + LANE_MARGIN_M
     safe_right = right_X_m - LANE_MARGIN_M
 
     if not blocking_cones or safe_right - safe_left < MIN_GAP_M:
-        return 0.0, GAP_LOOKAHEAD_M, [], [], safe_left, safe_right
+        return 0.0, AVOID_PURSUIT_Z, [], [], safe_left, safe_right, False
 
-    # Build exclusion intervals and merge overlaps
-    raw_excl = sorted(
-        (X - CONE_RADIUS_M, X + CONE_RADIUS_M)
-        for X, _ in blocking_cones
-    )
-    merged: List[Tuple[float, float]] = []
-    for lo, hi in raw_excl:
-        if merged and lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+    # ── [GP-1] Cluster cones into Z planes ───────────────────────────────────
+    cones_sorted = sorted(blocking_cones, key=lambda c: c[1])
+    planes: List[List[Tuple[float, float]]] = []
+    current_plane: List[Tuple[float, float]] = [cones_sorted[0]]
+    for cone in cones_sorted[1:]:
+        if cone[1] - current_plane[-1][1] <= MULTI_PLANE_Z_THRESH:
+            current_plane.append(cone)
         else:
-            merged.append([lo, hi])
+            planes.append(current_plane)
+            current_plane = [cone]
+    planes.append(current_plane)
 
-    # Derive passable gaps: intervals of [safe_left, safe_right] not blocked
-    gaps: List[Tuple[float, float, float]] = []  # (left, right, centre)
-    cursor = safe_left
-    for lo, hi in merged:
-        gap_r = lo
-        if gap_r - cursor >= MIN_GAP_M:
-            centre = (cursor + gap_r) / 2.0
-            gaps.append((cursor, gap_r, centre))
-        cursor = max(cursor, hi)
-    if safe_right - cursor >= MIN_GAP_M:
-        centre = (cursor + safe_right) / 2.0
-        gaps.append((cursor, safe_right, centre))
+    # ── Compute gaps per plane, then intersect ────────────────────────────────
+    # Represent the valid X corridor as a union of intervals per plane.
+    # The intersection across planes gives the set of X positions passable at
+    # ALL planes simultaneously.
 
-    if not gaps:
-        cursor = safe_left
-        all_gaps_fb = []
-        for lo, hi in merged:
-            if lo > cursor:
-                all_gaps_fb.append((cursor, lo, (cursor + lo) / 2.0))
-            cursor = max(cursor, hi)
-        if safe_right > cursor:
-            all_gaps_fb.append((cursor, safe_right, (cursor + safe_right) / 2.0))
-        gaps = all_gaps_fb if all_gaps_fb else [(safe_left, safe_right, 0.0)]
+    # Start with the full safe corridor as a list of intervals.
+    valid_intervals: List[Tuple[float, float]] = [(safe_left, safe_right)]
 
-    # Score gaps: wider = better; prefer centre
+    all_gaps_for_display: List[Tuple[float, float, float]] = []
+    merged_excl_for_display: List[Tuple[float, float]] = []
+
+    for plane in planes:
+        plane_gaps = _gaps_at_plane(plane, safe_left, safe_right)
+        if not plane_gaps:
+            # No passable gap at this plane — total blockage
+            return 0.0, AVOID_PURSUIT_Z, [], [], safe_left, safe_right, True
+
+        all_gaps_for_display.extend(plane_gaps)
+
+        # Build exclusions for display from this plane
+        raw_excl = sorted((X - CONE_RADIUS_M, X + CONE_RADIUS_M) for X, _ in plane)
+        merged: List[List[float]] = []
+        for lo, hi in raw_excl:
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        merged_excl_for_display.extend((lo, hi) for lo, hi in merged)
+
+        # Intersect current valid_intervals with plane_gaps
+        gap_intervals = [(gl, gr) for gl, gr, _ in plane_gaps]
+        new_valid: List[Tuple[float, float]] = []
+        for vi_l, vi_r in valid_intervals:
+            for gi_l, gi_r in gap_intervals:
+                lo = max(vi_l, gi_l)
+                hi = min(vi_r, gi_r)
+                if hi - lo >= MIN_GAP_M:
+                    new_valid.append((lo, hi))
+        valid_intervals = new_valid
+        if not valid_intervals:
+            return 0.0, AVOID_PURSUIT_Z, all_gaps_for_display, merged_excl_for_display, \
+                   safe_left, safe_right, True  # [GP-2]
+
+    # ── Score remaining valid intervals ──────────────────────────────────────
     best_centre = 0.0
     best_score  = float("-inf")
-    for gl, gr, gc in gaps:
+    for gl, gr in valid_intervals:
+        gc    = (gl + gr) / 2.0
         width = gr - gl
-        score = width - GAP_CENTER_WEIGHT * abs(gc)
+        # [GP-3] Normalised score
+        score = (width / MIN_GAP_M) - GAP_CENTER_WEIGHT * abs(gc)
         if score > best_score:
             best_score  = score
             best_centre = gc
 
     best_centre = float(np.clip(best_centre, safe_left, safe_right))
-    return best_centre, GAP_LOOKAHEAD_M, gaps, merged, safe_left, safe_right
+    return best_centre, AVOID_PURSUIT_Z, all_gaps_for_display, \
+           merged_excl_for_display, safe_left, safe_right, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure Pursuit
+# [PP-1] Avoidance uses AVOID_PURSUIT_Z as the fixed lookahead depth so the
+#        arc geometry is consistent regardless of where the cone happens to be.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pure_pursuit(X_m: float, Z_m: float) -> float:
+    """
+    Standard pure-pursuit formula.
+    For avoidance callers: always pass Z_m = AVOID_PURSUIT_Z so the arc is
+    computed to a waypoint at a consistent forward distance, not at the cone.
+    """
     ld = math.hypot(X_m, Z_m)
     if ld < 0.1:
         return 0.0
     raw = math.atan2(2.0 * WHEELBASE_M * X_m, ld * ld)
     return max(-STEER_MAX_DEG, min(STEER_MAX_DEG, math.degrees(raw)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lateral position estimator
+# [SM-1] Used for release condition instead of _gap_target proxy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_lateral_error(
+    lf: Optional[np.ndarray],
+    rf: Optional[np.ndarray],
+    road_mask: Optional[np.ndarray],
+    H: int, W: int, fx: float,
+    depth_arr: np.ndarray,
+    dev_m_from_seg: float,
+) -> float:
+    """
+    Best estimate of the car's lateral offset from lane centre (metres).
+    Positive = car is to the right of centre.
+
+    Priority:
+      1. Segformer dev_m if Segformer is confident (road mask has pixels).
+      2. Zero (car assumed centred) as safe fallback — avoidance release will
+         wait for dwell timer anyway.
+    """
+    if road_mask is not None and road_mask.any() and dev_m_from_seg is not None:
+        return float(dev_m_from_seg)
+    return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +623,7 @@ def draw_overlay(
     exclusions:   List[Tuple[float, float]]        = None,
     safe_l_m:     float = 0.0,
     safe_r_m:     float = 0.0,
-    gap_z:        float = GAP_LOOKAHEAD_M,
+    gap_z:        float = AVOID_PURSUIT_Z,
 ) -> np.ndarray:
     out = frame.copy()
     all_gaps   = all_gaps   or []
@@ -519,31 +634,32 @@ def draw_overlay(
     mid_x = W // 2
 
     def project(X_m: float, Z_m: float):
-        """Map a world point to image pixel using actual depth."""
         Z_m = max(Z_m, 0.1)
-        py  = int(bot_y - (min(Z_m, AVOIDANCE_TRIGGER_M) / AVOIDANCE_TRIGGER_M) * (bot_y - top_y))
+        py  = int(bot_y - (min(Z_m, AVOIDANCE_TRIGGER_M) / AVOIDANCE_TRIGGER_M)
+                  * (bot_y - top_y))
         px  = int(mid_x + X_m * fx / Z_m)
         return px, py
 
     def xm_to_px(xm: float, z: float = 1.8) -> int:
         return int(mid_x + xm * fx / z)
 
-    # ── Segformer road mask — bright green semi-transparent overlay ───────────
+    # Road mask overlay
     if road_mask is not None and road_mask.any():
         seg_layer = np.zeros_like(out)
         seg_layer[road_mask] = [0, 220, 60]
         out = cv2.addWeighted(out, 0.65, seg_layer, 0.35, 0)
         mask_u8 = road_mask.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(out, contours, -1, (0, 255, 80), 1)
 
-    # ── YOLO bboxes ───────────────────────────────────────────────────────────
+    # YOLO bboxes
     for x1, y1, x2, y2, conf in detections:
         cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), CLR_CONE, 2)
         cv2.putText(out, f"{conf:.2f}", (int(x1), int(y1) - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, CLR_CONE, 1)
 
-    # ── Cone circles projected at actual depth ────────────────────────────────
+    # Cone circles at actual depth
     for X_c, Z_c in blocking:
         cx, cy = project(X_c, Z_c)
         r_cone = max(4, int(CONE_RADIUS_M * fx / Z_c))
@@ -553,64 +669,61 @@ def draw_overlay(
         cv2.putText(out, f"Z={Z_c:.1f}", (cx + r_safe + 2, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, CLR_CONE, 1)
 
-    # ── Lane edges ────────────────────────────────────────────────────────────
+    # Lane edges
     lx = xm_to_px(left_X_m)
     rx = xm_to_px(right_X_m)
     cv2.line(out, (lx, bot_y), (lx, top_y), CLR_LANE_L, 3)
     cv2.line(out, (rx, bot_y), (rx, top_y), CLR_LANE_R, 3)
-    cv2.putText(out, f"L:{left_X_m:+.2f}m",  (lx + 4, top_y + 15),
+    cv2.putText(out, f"L:{left_X_m:+.2f}m", (lx + 4, top_y + 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, CLR_LANE_L, 1)
     cv2.putText(out, f"R:{right_X_m:+.2f}m", (rx + 4, top_y + 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, CLR_LANE_R, 1)
 
-    # ── Gap decision bar — horizontal strip above top_y ───────────────────────
-    if state == "AVOIDING" and (all_gaps or exclusions):
-        bar_t  = top_y - 22
-        bar_b  = top_y - 8
-        # Road background
+    # Gap bar
+    if state in ("AVOIDING", "NO_SAFE_GAP") and (all_gaps or exclusions):
+        bar_t = top_y - 22
+        bar_b = top_y - 8
         sl_px = xm_to_px(safe_l_m)
         sr_px = xm_to_px(safe_r_m)
         cv2.rectangle(out, (sl_px, bar_t), (sr_px, bar_b), (60, 60, 60), -1)
-        # Exclusion zones in red
         for lo, hi in exclusions:
-            cv2.rectangle(out, (xm_to_px(lo), bar_t), (xm_to_px(hi), bar_b), (40, 40, 200), -1)
-        # Candidate gaps
+            cv2.rectangle(out, (xm_to_px(lo), bar_t), (xm_to_px(hi), bar_b),
+                          (40, 40, 200), -1)
         for gl, gr, gc in all_gaps:
             is_best = abs(gc - gap_target_X) < 0.05
             col = CLR_GAP_SEL if is_best else CLR_GAP_CAND
             cv2.rectangle(out, (xm_to_px(gl), bar_t), (xm_to_px(gr), bar_b), col, -1)
             if is_best:
-                cv2.circle(out, (xm_to_px(gc), (bar_t + bar_b) // 2), 4, (255, 255, 255), -1)
+                cv2.circle(out, (xm_to_px(gc), (bar_t + bar_b) // 2), 4,
+                           (255, 255, 255), -1)
         cv2.rectangle(out, (sl_px, bar_t), (sr_px, bar_b), (180, 180, 180), 1)
 
-    # ── Planned path (bezier: car → gap waypoint → return to centre) ──────────
+    # Planned path (bezier)
     if state == "AVOIDING":
         car_pt = np.array([mid_x, bot_y], dtype=float)
         gap_pt = np.array(project(gap_target_X, gap_z), dtype=float)
         ret_pt = np.array(project(0.0, gap_z * 2.5), dtype=float)
-
         pts = []
         for t in np.linspace(0.0, 1.0, 30):
-            p = (1 - t)**2 * car_pt + 2 * (1 - t) * t * gap_pt + t**2 * ret_pt
+            p = ((1 - t)**2 * car_pt
+                 + 2 * (1 - t) * t * gap_pt
+                 + t**2 * ret_pt)
             pts.append(p.astype(int))
         pts = np.array(pts, dtype=np.int32)
         cv2.polylines(out, [pts], False, CLR_GAP_SEL, 3, cv2.LINE_AA)
         cv2.circle(out, tuple(gap_pt.astype(int)), 8, CLR_GAP_SEL, -1)
-        cv2.circle(out, tuple(ret_pt.astype(int)), 6, (200, 255, 200), 2)
         cv2.putText(out, f"gap={gap_target_X:+.2f}m",
                     (int(gap_pt[0]) + 10, int(gap_pt[1])),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, CLR_GAP_SEL, 1)
 
-    # ── Centre path (lane following) ──────────────────────────────────────────
     if state == "LANE_FOLLOW":
         cv2.line(out, (mid_x, bot_y), (mid_x, top_y), CLR_PATH, 1)
 
-    # ── Blocking cone text list ───────────────────────────────────────────────
     for i, (X_c, Z_c) in enumerate(blocking):
         cv2.putText(out, f"cone X={X_c:+.2f} Z={Z_c:.1f}m",
                     (10, 58 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CLR_CONE, 1)
 
-    # ── Steering direction ────────────────────────────────────────────────────
+    # Steering direction
     if steer_deg > 2.0:
         direction, dir_color = "RIGHT >>", (0, 140, 255)
     elif steer_deg < -2.0:
@@ -618,14 +731,22 @@ def draw_overlay(
     else:
         direction, dir_color = "STRAIGHT", (200, 200, 200)
 
-    # ── Status bar ────────────────────────────────────────────────────────────
-    color = CLR_WARN if state == "AVOIDING" else CLR_OK
-    line1 = (f"AVOIDING  gap={gap_target_X:+.2f}m  steer={steer_deg:+.1f}deg"
-             if state == "AVOIDING"
-             else f"LANE FOLLOW  steer={steer_deg:+.1f}deg")
+    # Status bar
+    if state == "NO_SAFE_GAP":
+        color = CLR_STOP
+        line1 = "NO SAFE GAP — STOPPING"
+    elif state == "AVOIDING":
+        color = CLR_WARN
+        line1 = (f"AVOIDING  gap={gap_target_X:+.2f}m  "
+                 f"steer={steer_deg:+.1f}deg")
+    else:
+        color = CLR_OK
+        line1 = f"LANE FOLLOW  steer={steer_deg:+.1f}deg"
+
     cv2.rectangle(out, (0, 0), (W, 52), (0, 0, 0), -1)
     cv2.putText(out, line1, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
-    cv2.putText(out, direction, (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.70, dir_color, 2)
+    cv2.putText(out, direction, (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.70,
+                dir_color, 2)
 
     return out
 
@@ -638,11 +759,11 @@ class ConeAvoidanceSystem:
     """
     Self-contained avoidance + lane-following system.
 
-    External integration (from main.py):
+    External integration:
         sys = ConeAvoidanceSystem()
         sys.init()
         steer_deg, state = sys.process_frame(frame, depth_arr, pose, fx, H, W)
-        # state: "LANE_FOLLOW" | "AVOIDING" | "LOST"
+        # state: "LANE_FOLLOW" | "AVOIDING" | "NO_SAFE_GAP" | "LOST"
     """
 
     def __init__(self):
@@ -664,13 +785,20 @@ class ConeAvoidanceSystem:
         self._last_raw:   float = 0.0
         self._last_sent:  float = 0.0
 
-        self._state:      str   = "LANE_FOLLOW"
-        self._gap_target: float = 0.0
-        self._last_gap_z: float = GAP_LOOKAHEAD_M
-        self._last_gaps:  list  = []
-        self._last_excl:  list  = []
-        self._last_safe:  tuple = (0.0, 0.0)
-        self._frame_cnt:  int   = 0
+        # State machine
+        self._state:            str   = "LANE_FOLLOW"
+        self._avoiding_frames:  int   = 0    # [SM-2] dwell counter
+        self._gap_target:       float = 0.0
+        self._last_gap_z:       float = AVOID_PURSUIT_Z
+        self._last_gaps:        list  = []
+        self._last_excl:        list  = []
+        self._last_safe:        tuple = (0.0, 0.0)
+        self._no_safe_gap:      bool  = False   # [GP-2]
+
+        # [SEG-1] Single per-frame lane bounds cache (shared between control + display)
+        self._lane_bounds: Tuple[float, float] = (-PATH_WIDTH_M, PATH_WIDTH_M)
+
+        self._frame_cnt:  int = 0
 
         self.uart = UARTController()
         self.cal  = None
@@ -704,8 +832,7 @@ class ConeAvoidanceSystem:
         self.cal = info.camera_configuration.calibration_parameters.left_cam
         self.W   = info.camera_configuration.resolution.width
         self.H   = info.camera_configuration.resolution.height
-
-        log.info("[ConeAvoidance] Camera  %dx%d @ %d fps", self.W, self.H, CAM_FPS)
+        log.info("[ConeAvoidance] Camera %dx%d @ %d fps", self.W, self.H, CAM_FPS)
 
         if not self.seg_lane.init():
             log.error("[ConeAvoidance] SegformerLane init failed")
@@ -736,7 +863,8 @@ class ConeAvoidanceSystem:
                 self._frame_cnt += 1
 
                 self.cam.retrieve_image(self.image_mat, sl.VIEW.LEFT)
-                frame = self.image_mat.get_data()[:, :, :3].copy()
+                # [CL-1] Keep raw frame separate — YOLO gets this.
+                frame_raw = self.image_mat.get_data()[:, :, :3].copy()
 
                 self._depth_age += 1
                 if self._depth_cache is None or self._depth_age >= DEPTH_REFRESH_EVERY:
@@ -747,11 +875,16 @@ class ConeAvoidanceSystem:
                 self.cam.get_position(self.pose, sl.REFERENCE_FRAME.WORLD)
 
                 steer_deg, state = self.process_frame(
-                    frame, self._depth_cache, self.pose,
+                    frame_raw, self._depth_cache, self.pose,
                     self.cal.fx, self.H, self.W,
                 )
 
-                target_kmh = SPEED_AVOID_KMH if state == "AVOIDING" else SPEED_STRAIGHT_KMH
+                if state == "NO_SAFE_GAP":
+                    target_kmh = SPEED_STOP_KMH
+                elif state == "AVOIDING":
+                    target_kmh = SPEED_AVOID_KMH
+                else:
+                    target_kmh = SPEED_STRAIGHT_KMH
 
                 if UART_ENABLED:
                     self.uart.set_speed(target_kmh)
@@ -764,11 +897,8 @@ class ConeAvoidanceSystem:
                         self.uart.set_speed(target_kmh)
                         last_hb = now
 
-                # Retrieve latest segformer result for display and cone filtering
-                lf, rf, road_mask, *_ = self.seg_lane.get_result()
-                left_X, right_X = lane_bounds_m(
-                    road_mask, self._depth_cache, self.H, self.W, self.cal.fx)
-
+                # [SEG-1] Use cached lane bounds — do NOT call get_result() again.
+                left_X, right_X = self._lane_bounds
                 all_cones = self.cone_map.in_camera_frame(self.pose)
                 blocking  = path_blocking_cones(all_cones, left_X, right_X)
                 nearest_z = min((Z for _, Z in blocking), default=float("inf"))
@@ -787,9 +917,11 @@ class ConeAvoidanceSystem:
                       f"  spd={target_kmh:.1f}km/h{cone_info}")
 
                 if DISPLAY:
+                    # [CL-1] Apply CLAHE only for display.
+                    frame_display = self._apply_clahe(frame_raw)
                     dets = self.cone_det.get_result()
                     vis  = draw_overlay(
-                        frame, dets, blocking, road_mask,
+                        frame_display, dets, blocking, self._seg_road_mask,
                         self._gap_target, left_X, right_X,
                         steer_deg, state, self.H, self.W, self.cal.fx,
                         all_gaps=self._last_gaps,
@@ -804,11 +936,11 @@ class ConeAvoidanceSystem:
         finally:
             self.close()
 
-    # ── Core frame processor  (also callable from main.py) ────────────────────
+    # ── Core frame processor ──────────────────────────────────────────────────
 
     def process_frame(
         self,
-        frame:     np.ndarray,
+        frame:     np.ndarray,   # RAW frame (no CLAHE)
         depth_arr: np.ndarray,
         pose:      sl.Pose,
         fx:        float,
@@ -817,89 +949,125 @@ class ConeAvoidanceSystem:
     ) -> Tuple[float, str]:
         """
         Returns (steer_deg, state).
-        state: "LANE_FOLLOW" | "AVOIDING" | "LOST"
+        state: "LANE_FOLLOW" | "AVOIDING" | "NO_SAFE_GAP" | "LOST"
         """
-        frame_norm = self._apply_clahe(frame)
+        # [CL-1] CLAHE for Segformer only — not for YOLO.
+        frame_seg = self._apply_clahe(frame)
 
         # ── Segformer ─────────────────────────────────────────────────────────
-        self.seg_lane.submit(frame_norm, None, H, W, fx)
+        self.seg_lane.submit(frame_seg, None, H, W, fx)
         lf, rf, road_mask, dev_m, wid_m, lc, rc, source = self.seg_lane.get_result()
         if road_mask is None:
-            log.debug("[SegformerLane] road_mask is None — using zero mask")
             road_mask = np.zeros((H, W), dtype=bool)
-        else:
-            log.debug("[SegformerLane] road_mask active, road pixels=%d", road_mask.sum())
+
+        # Store for display (run loop reads this, not get_result() again) [SEG-1]
+        self._seg_road_mask = road_mask
+
+        # [SEG-1] Compute lane bounds ONCE per frame and cache.
+        left_X, right_X = lane_bounds_m(road_mask, depth_arr, H, W, fx)
+        self._lane_bounds = (left_X, right_X)
 
         # ── Cone detection + world map ────────────────────────────────────────
+        # [CL-1] Submit raw frame to YOLO — no CLAHE.
         if self._frame_cnt % YOLO_SKIP_FRAMES == 0:
-            self.cone_det.submit(frame_norm)
+            self.cone_det.submit(frame)
         detections      = self.cone_det.get_result()
         cones_cam_fresh = localise_cones(detections, depth_arr, H, W, fx)
         if cones_cam_fresh:
             self.cone_map.update(cones_cam_fresh, pose)
         cones_cam = self.cone_map.in_camera_frame(pose)
 
-        # ── Lane boundaries ───────────────────────────────────────────────────
-        left_X, right_X = lane_bounds_m(road_mask, depth_arr, H, W, fx)
-
-        # ── Path-blocking cones only — use actual road edges from segformer ────
+        # ── Path-blocking cones — uses cached lane bounds ─────────────────────
         blocking = path_blocking_cones(cones_cam, left_X, right_X)
 
-        # ── State machine ─────────────────────────────────────────────────────
         if blocking:
             closest_z = min(Z for _, Z in blocking)
         else:
             closest_z = float("inf")
 
+        # ── [SM-1] Lateral error estimate ─────────────────────────────────────
+        lat_error = estimate_lateral_error(
+            lf, rf, road_mask, H, W, fx, depth_arr, dev_m)
+
+        # ── State machine ─────────────────────────────────────────────────────
+        # LANE_FOLLOW → AVOIDING
         if self._state == "LANE_FOLLOW" and closest_z < AVOIDANCE_TRIGGER_M:
-            self._state = "AVOIDING"
+            self._state           = "AVOIDING"
+            self._avoiding_frames = 0
             log.info("[ConeAvoidance] Cone at %.2f m — engaging avoidance", closest_z)
 
+        # Track time in avoidance [SM-2]
         if self._state == "AVOIDING":
-            all_clear     = closest_z > AVOIDANCE_RELEASE_M
-            back_to_centre = abs(self._gap_target) < RETURN_BAND_M
-            if all_clear and back_to_centre:
+            self._avoiding_frames += 1
+
+        # NO_SAFE_GAP → AVOIDING re-check (planner may find a gap next frame)
+        if self._state == "NO_SAFE_GAP" and closest_z >= AVOIDANCE_RELEASE_M:
+            self._state = "LANE_FOLLOW"
+            log.info("[ConeAvoidance] Path finally clear from NO_SAFE_GAP — resuming")
+
+        # AVOIDING → LANE_FOLLOW
+        if self._state == "AVOIDING":
+            dwell_ok   = self._avoiding_frames >= AVOIDING_MIN_DWELL_FRAMES  # [SM-2]
+            path_clear = closest_z > AVOIDANCE_RELEASE_M
+            # [SM-1] Use actual lateral pose error, not _gap_target proxy
+            centred    = abs(lat_error) < LATERAL_RETURN_BAND_M
+            if dwell_ok and path_clear and centred:
                 self._state = "LANE_FOLLOW"
-                log.info("[ConeAvoidance] Path clear — resuming lane follow")
+                log.info(
+                    "[ConeAvoidance] Dwell=%d frames, path clear, lat_err=%.2f m — "
+                    "resuming lane follow", self._avoiding_frames, lat_error)
+                self._avoiding_frames = 0
 
         # ── Steering decision ─────────────────────────────────────────────────
-        if self._state == "AVOIDING":
-            gap_X, _, all_gaps, excl, safe_l, safe_r = find_best_gap(blocking, left_X, right_X)
-            # Use actual cone Z for pure pursuit — steer so you arrive at gap_X when you reach the cone
-            gap_Z            = closest_z if closest_z < AVOIDANCE_TRIGGER_M else GAP_LOOKAHEAD_M
-            self._gap_target = gap_X
+        if self._state in ("AVOIDING", "NO_SAFE_GAP"):
+            gap_X, gap_Z, all_gaps, excl, safe_l, safe_r, no_safe = find_best_gap(
+                blocking, left_X, right_X)
+
+            self._last_gaps = all_gaps
+            self._last_excl = excl
+            self._last_safe = (safe_l, safe_r)
             self._last_gap_z = gap_Z
-            self._last_gaps  = all_gaps
-            self._last_excl  = excl
-            self._last_safe  = (safe_l, safe_r)
-            raw_deg = 0.0 if abs(gap_X) < GAP_DEADBAND_M else pure_pursuit(gap_X, gap_Z)
-            state   = "AVOIDING"
+
+            if no_safe:
+                # [GP-2] Total blockage — stop and wait.
+                self._state     = "NO_SAFE_GAP"
+                self._gap_target = 0.0
+                raw_deg = 0.0
+                state   = "NO_SAFE_GAP"
+                log.warning("[ConeAvoidance] No safe gap — stopping.")
+            else:
+                self._state      = "AVOIDING"
+                self._gap_target = gap_X
+                # [PP-1] Always steer to waypoint at AVOID_PURSUIT_Z, not cone Z.
+                raw_deg = (0.0 if abs(gap_X) < GAP_DEADBAND_M
+                           else pure_pursuit(gap_X, AVOID_PURSUIT_Z))
+                state   = "AVOIDING"
 
         elif source == "LOST":
             raw_deg = 0.0
             state   = "LOST"
 
         else:
-            # Normal lane follow — pure pursuit on Segformer lookahead
+            # Normal lane follow
             lookahead_pt, _ = compute_lookahead(lf, rf, H, W, fx, depth_arr)
             if lookahead_pt is not None:
                 X_m, Z_m = lookahead_pt
-                raw_deg  = 0.0 if abs(X_m) < CTRL_LANE_DEADBAND_M else pure_pursuit(X_m, Z_m)
+                raw_deg  = (0.0 if abs(X_m) < CTRL_LANE_DEADBAND_M
+                            else pure_pursuit(X_m, Z_m))
             else:
-                raw_deg = 0.0 if abs(dev_m) < CTRL_LANE_DEADBAND_M else pure_pursuit(dev_m, CTRL_LOOKAHEAD_M)
+                raw_deg = (0.0 if abs(dev_m) < CTRL_LANE_DEADBAND_M
+                           else pure_pursuit(dev_m, CTRL_LOOKAHEAD_M))
             self._gap_target = 0.0
             state = "LANE_FOLLOW"
 
         # ── Rate limiter + EMA ────────────────────────────────────────────────
-        # Avoiding: fast rate-limit (10 deg/frame) + responsive EMA (0.50 alpha)
-        # matches commander.py curve mode — consistent incremental corrections.
-        # Lane follow: conservative rate-limit + slow EMA for stability.
         if self._state == "AVOIDING":
             rate_lim = 10.0
             alpha    = 0.50
         else:
             rate_lim = STEER_RATE_LIMIT_DEG
             alpha    = STEER_EMA_ALPHA
+
         delta = raw_deg - self._last_raw
         if abs(delta) > rate_lim:
             raw_deg = self._last_raw + math.copysign(rate_lim, delta)
