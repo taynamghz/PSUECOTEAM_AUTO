@@ -76,7 +76,7 @@ UART_HEARTBEAT_S   = 0.080   # force retransmit every 80ms — keeps Nucleo watc
 # ── Vehicle commands ────────────────────────────────────────────────────────────
 # The Nucleo runs a PID controller internally.
 # Jetson sends ONLY the setpoints; Nucleo handles throttle, braking, and PWM.
-STOP_BRAKE_DIST_M = 1.0     # stop-line/sign within this distance → send CMD_BRAKE
+STOP_BRAKE_DIST_M = 3.5     # stop-line/sign within this distance → send CMD_BRAKE
 BRAKE_VALUE       = 255     # brake intensity byte sent with CMD_BRAKE
 
 # ── Target speed setpoints ────────────────────────────────────────────────────
@@ -87,14 +87,16 @@ SPEED_CURVE_THRESH        = 0.15   # |κ| (m⁻¹) above which we slow to curve 
 
 # ── Lane-following control (Pure Pursuit) ─────────────────────────────────────
 WHEELBASE_M              = 1.6   # vehicle wheelbase — VERIFY before first run
-CTRL_LOOKAHEAD_M         = 2.2   # assumed depth to road centre at the far row (metres)
-                                  # calibrate: drive toward a mark 2.2m away, check X_m ≈ 0
-CTRL_LANE_DEADBAND_M     = 0.15  # ignore lateral offsets smaller than this (metres)
-                                  # car can wander ±15cm from centre without correction
-                                  # increase for more relaxed lane-keeping, decrease for tighter tracking
+CTRL_LOOKAHEAD_M         = 4.0   # lookahead distance (metres) — must be ≥ 2×wheelbase to avoid S-swerves
+                                  # was 2.2 (too short: near-max steer at 0.5m offset → oscillation)
+CTRL_LANE_DEADBAND_M     = 0.05  # ignore lateral offsets smaller than this (metres)
+                                  # was 0.15 — large deadband caused drift→hard-correct→overshoot cycles
 CTRL_HEADING_ALPHA       = 0.20  # EMA alpha for heading angle  (lower = smoother)
 CTRL_CURVATURE_ALPHA     = 0.15  # EMA alpha for curvature      (extra-smooth)
 CTRL_EVAL_Y_FRAC         = 0.60  # image-row fraction to evaluate heading/curvature
+HEADING_FF_GAIN          = 0.40  # feed-forward fraction of heading angle added to Pure Pursuit output
+                                  # pre-steers into curves before lateral deviation builds up
+                                  # positive heading_angle = curve-left → negative steer correction
 
 # ── Steering output ────────────────────────────────────────────────────────────
 # Data flow every frame:
@@ -165,3 +167,57 @@ SEG_FIT_TOP_FRAC        = 0.72  # only fit boundary rows BELOW this fraction of 
                                  # = approx. lookahead distance (2.5 m) in image space
                                  # rows above this are far/wide/noisy and blow up the polynomial
 SEG_CENTERLINE_ALPHA    = 0.30  # EMA weight for centerline polynomial — lower = smoother/slower
+
+# ── Road surface validator (asphalt vs. grass) ────────────────────────────────
+# Samples a thin strip just inside each detected road boundary.
+# If that strip is predominantly grass-coloured, the road mask is trimmed inward
+# to the first non-grass pixel, shifting the perceived centerline away from grass.
+# This runs post-Segformer in the worker thread (~1-2 ms, no inference).
+GRASS_H_MIN         = 35    # HSV hue lower — green start
+GRASS_H_MAX         = 85    # HSV hue upper — green end (covers yellow-green to blue-green)
+GRASS_S_MIN         = 55    # min saturation — rejects pale/dry/dead grass
+GRASS_V_MIN         = 40    # min value — rejects shadow grass
+GRASS_INNER_PAD     = 8     # px strip sampled just inside detected boundary
+GRASS_FRAC_THRESH   = 0.50  # fraction of inner strip that must be grass to trigger trim
+GRASS_MAX_TRIM_FRAC = 0.20  # max boundary trim as fraction of current lane width
+
+# ── Perception safety ──────────────────────────────────────────────────────────
+LOST_BRAKE_ENABLED = True   # set False to disable emergency brake on lost road (testing)
+LOST_BRAKE_FRAMES  = 15     # consecutive LOST frames before brake triggers (~500 ms at 30 fps)
+
+# ── Stop-sign detection ────────────────────────────────────────────────────────
+# Set False to disable entirely (no GPU, no thread, no brake from sign)
+STOP_SIGN_ENABLED = True
+
+# ── Cone avoidance ────────────────────────────────────────────────────────────
+# Set False to run pure lane-following with no cone awareness
+CONE_AVOIDANCE_ENABLED = True
+
+# YOLOv5 cone model
+CONE_MODEL_PATH    = "perception_stack/weights/cones.pt"
+CONE_CONF_THRESH   = 0.40
+CONE_IMG_SIZE      = 416
+CONE_SKIP_FRAMES   = 2          # run YOLO every N frames (budget control)
+
+# Cone 3D localisation
+CONE_DEPTH_PAD     = 6          # patch half-size (px) for ZED depth median
+CONE_Z_MIN_M       = 0.3
+CONE_Z_MAX_M       = 8.0
+
+# Avoidance trigger / release
+# A cone must be inside the forward corridor (|X| < PATH_WIDTH_M) AND close in Z.
+# Cones to the side of the road are ignored entirely.
+AVOIDANCE_TRIGGER_M = 5.0       # engage when a blocking cone enters this range
+AVOIDANCE_RELEASE_M = 6.5       # release only when ALL blocking cones exit this range
+PATH_WIDTH_M        = 1.0       # lateral half-corridor that counts as "blocking"
+RETURN_BAND_M       = 0.20      # also require actual deviation < this before releasing
+
+# Gap planner geometry
+GAP_CAR_WIDTH_M     = 1.20      # full vehicle width — measured physically
+GAP_CONE_RADIUS_M   = 0.15      # treat each cone as a cylinder of this radius
+GAP_LOOKAHEAD_M     = 1.8       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
+GAP_CENTER_WEIGHT   = 0.40      # score penalty for gaps away from lane centre
+LANE_MARGIN_M       = 0.10      # min distance from grass edge for gap targets (loose — tunable)
+
+# Speed during avoidance — slow for precise manoeuvring
+SPEED_AVOID_KMH     = 1.0

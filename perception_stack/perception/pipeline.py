@@ -30,6 +30,10 @@ from perception_stack.config import (
     FPS_WARN_BELOW,
     PC_REFRESH_EVERY,
     LANE_ENABLED,
+    LOST_BRAKE_ENABLED,
+    LOST_BRAKE_FRAMES,
+    STOP_SIGN_ENABLED,
+    CONE_AVOIDANCE_ENABLED,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.lane.fitting import eval_x
@@ -38,6 +42,7 @@ from perception_stack.lane.control import (
 )
 from perception_stack.detection.stop_line import detect_stop_line
 from perception_stack.detection.stop_sign import StopSignDetector
+from perception_stack.detection.cone_avoider import ConeAvoider
 from perception_stack.perception.segformer_lane import SegformerLane
 
 
@@ -74,7 +79,8 @@ class LanePerception:
         self._last_stop_y:    Optional[int] = None
 
         # Detectors
-        self.sign_detector = StopSignDetector()
+        self.sign_detector = StopSignDetector() if STOP_SIGN_ENABLED else None
+        self.cone_avoider  = ConeAvoider()      if CONE_AVOIDANCE_ENABLED else None
         self.seg_lane      = SegformerLane()
 
         # CLAHE for lighting normalisation (one instance reused every frame)
@@ -88,6 +94,9 @@ class LanePerception:
 
         # Full XYZ cache — only retrieved when stop-line/sign detection is active.
         self._pc_cache: Optional[np.ndarray] = None
+
+        # Consecutive LOST-source frame counter — triggers emergency_stop after threshold
+        self._lost_frame_cnt: int = 0
 
         # Rolling frame-time buffer for FPS monitoring
         self._frame_times: collections.deque = collections.deque(maxlen=30)
@@ -129,6 +138,10 @@ class LanePerception:
         if LANE_ENABLED:
             if not self.seg_lane.init():
                 print("[Perception] SegformerLane init failed — lane detection disabled")
+
+        if CONE_AVOIDANCE_ENABLED and self.cone_avoider is not None:
+            if not self.cone_avoider.init():
+                print("[Perception] ConeAvoider init failed — cone avoidance disabled")
 
         return True
 
@@ -184,7 +197,9 @@ class LanePerception:
 
         # ── Full XYZ point-cloud (for stop-line/sign distance only) ───────────
         # Only retrieved when a detection vote is accumulating — rare during race.
-        sign_active = self.sign_detector.get_result()[0]
+        # Skipped entirely when STOP_SIGN_ENABLED=False and no stop-line votes.
+        sign_active = (STOP_SIGN_ENABLED and
+                       self.sign_detector.get_result()[0])
         need_pc = (
             self._pc_cache is None
             or sign_active
@@ -199,8 +214,11 @@ class LanePerception:
         if PROFILE_ENABLED: t = self._tick("grab+retrieve", t)
 
         # ── Stop-sign detector (non-blocking — runs in its own thread) ────────
-        self.sign_detector.submit(frame_norm, pc, self.H, self.W)
-        sign_confirmed, sign_dist, sign_bbox = self.sign_detector.get_result()
+        if STOP_SIGN_ENABLED:
+            self.sign_detector.submit(frame_norm, pc, self.H, self.W)
+            sign_confirmed, sign_dist, sign_bbox = self.sign_detector.get_result()
+        else:
+            sign_confirmed, sign_dist, sign_bbox = False, 0.0, None
 
         if PROFILE_ENABLED: t = self._tick("sign_detect", t)
 
@@ -213,10 +231,11 @@ class LanePerception:
         stop_confirmed = False
         out_y = None
         out_dist = 0.0
-        heading_sm  = self._last_heading
-        curv_sm     = self._last_curvature
+        heading_sm      = self._last_heading
+        curv_sm         = self._last_curvature
         lookahead_world = lookahead_px = None
-        source = "DISABLED"
+        source          = "DISABLED"
+        avoidance_state = "LANE_FOLLOW"
 
         if LANE_ENABLED:
             # ── Segformer — adaptive submission rate ──────────────────────────
@@ -303,7 +322,34 @@ class LanePerception:
             lookahead_world, lookahead_px = compute_lookahead(
                 lf, rf, self.H, self.W, self.cal.fx, self._depth_cache)
 
+            # ── Cone avoidance override ───────────────────────────────────────
+            # Runs post-Segformer so it receives the grass-validated road_mask.
+            # When a blocking cone is detected, returns a synthetic lookahead
+            # point at the best gap centre — Commander's Pure Pursuit uses it
+            # identically to the normal Segformer lookahead.
+            if CONE_AVOIDANCE_ENABLED and self.cone_avoider is not None:
+                road_mask_bool = road_mask if isinstance(road_mask, np.ndarray) and road_mask.dtype == bool \
+                                 else (road_mask.astype(bool) if road_mask is not None else None)
+                av_world, av_px, avoidance_state = self.cone_avoider.process(
+                    frame_norm, self._depth_cache, road_mask_bool,
+                    dev, self.H, self.W, self.cal.fx, self.frame_cnt,
+                )
+                if av_world is not None:
+                    lookahead_world = av_world
+                    lookahead_px    = av_px
+
             if PROFILE_ENABLED: t = self._tick("control", t)
+
+        # ── LOST-state safety counter ─────────────────────────────────────────
+        # If Segformer loses the road for LOST_BRAKE_FRAMES consecutive frames,
+        # set emergency_stop so Commander applies the brake immediately.
+        if LANE_ENABLED:
+            if source == "LOST":
+                self._lost_frame_cnt += 1
+            else:
+                self._lost_frame_cnt = 0
+        else:
+            self._lost_frame_cnt = 0
 
         # ── Profiling dump ────────────────────────────────────────────────────
         if PROFILE_ENABLED and self.frame_cnt % PROFILE_PRINT_EVERY == 0:
@@ -342,6 +388,9 @@ class LanePerception:
             lookahead_point  = lookahead_world,
             lookahead_pixel  = lookahead_px,
             speed_kmh        = 0.0,   # filled by Commander after UART read
+            emergency_stop   = (LANE_ENABLED and LOST_BRAKE_ENABLED
+                                and self._lost_frame_cnt >= LOST_BRAKE_FRAMES),
+            avoidance_state  = avoidance_state,
         ), frame, fm
 
     def close(self):

@@ -38,3 +38,7 @@ class PerceptionResult:
 
     # ── Vehicle state ─────────────────────────────────────────────────────────
     speed_kmh: float = 0.0         # current vehicle speed from LLC UART
+
+    # ── Safety ────────────────────────────────────────────────────────────────
+    emergency_stop:  bool = False          # True when LOST for > LOST_BRAKE_FRAMES consecutive frames
+    avoidance_state: str  = "LANE_FOLLOW"  # LANE_FOLLOW | AVOIDING

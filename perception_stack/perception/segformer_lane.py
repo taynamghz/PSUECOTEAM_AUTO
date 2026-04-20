@@ -111,6 +111,7 @@ from perception_stack.config import (
     SEG_FIT_TOP_FRAC,
     SEG_CENTERLINE_ALPHA,
 )
+from perception_stack.detection.road_validator import validate_boundaries
 
 
 def _best_device() -> str:
@@ -349,8 +350,9 @@ class SegformerLane:
         r0, r1 = max(0, y_row - pad), min(h, y_row + pad)
         c0, c1 = max(0, x_col - pad), min(w, x_col + pad)
         patch  = pc[r0:r1, c0:c1, 2]
-        valid  = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
-        Z      = float(np.median(valid)) if len(valid) > 0 else 3.0
+        # ZED RIGHT_HANDED_Y_UP: forward = −Z  (objects ahead have negative Z)
+        valid  = patch[np.isfinite(patch) & (patch < -0.1) & (patch > -30.0)]
+        Z      = float(np.median(np.abs(valid))) if len(valid) > 0 else 3.0
         return px_val * Z / fx
 
     # ── Core inference (called only from worker thread) ────────────────────────
@@ -372,6 +374,11 @@ class SegformerLane:
         cx_frame = W / 2.0
 
         road_mask = self._road_mask(frame_bgr)
+
+        # Trim grass pixels from road boundaries before polynomial fitting.
+        # If the right (or left) inner strip is grass, the mask is trimmed inward
+        # to the first asphalt pixel → centerline shifts away from grass naturally.
+        road_mask = validate_boundaries(frame_bgr, road_mask, roi_top)
 
         near_pts, full_pts, wid_px_near = self._scan_roads(
             road_mask, roi_top, fit_top, y_near)

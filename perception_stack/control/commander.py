@@ -25,9 +25,11 @@ from perception_stack.config import (
     UART_ENABLED,
     STOP_BRAKE_DIST_M, BRAKE_VALUE,
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
+    SPEED_AVOID_KMH,
     WHEELBASE_M, CTRL_LOOKAHEAD_M, CTRL_LANE_DEADBAND_M,
     STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_LIMIT_DEG,
     STEER_EMA_ALPHA, STEER_TX_DEADBAND_DEG,
+    HEADING_FF_GAIN,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.control.uart import UARTController
@@ -36,8 +38,11 @@ log = logging.getLogger(__name__)
 
 
 def _deg_to_steer_byte(deg: float) -> int:
-    """Map ±STEER_MAX_DEG → [0, 255] with 127 = straight."""
-    return int(max(0, min(255, round(127.0 - deg * 127.0 / STEER_MAX_DEG))))
+    """Map ±STEER_MAX_DEG → [0, 255] with 127 = straight.
+    positive deg = steer right → byte > 127
+    negative deg = steer left  → byte < 127
+    """
+    return int(max(0, min(255, round(127.0 + deg * 127.0 / STEER_MAX_DEG))))
 
 
 class Commander:
@@ -146,6 +151,8 @@ class Commander:
 
     @staticmethod
     def _should_brake(result: PerceptionResult) -> bool:
+        if result.emergency_stop:
+            return True
         if result.stop_line and 0 < result.stop_line_dist <= STOP_BRAKE_DIST_M:
             return True
         if result.stop_sign and 0 < result.stop_sign_dist_m <= STOP_BRAKE_DIST_M:
@@ -156,7 +163,9 @@ class Commander:
 
     @staticmethod
     def _target_speed(result: PerceptionResult) -> float:
-        """Slow down on curves; maintain nominal speed on straights."""
+        """Avoidance < curve < straight — slowest always wins during manoeuvring."""
+        if result.avoidance_state == "AVOIDING":
+            return SPEED_AVOID_KMH
         if abs(result.curvature) > SPEED_CURVE_THRESH:
             return SPEED_TARGET_CURVE_KMH
         return SPEED_TARGET_STRAIGHT_KMH
@@ -181,8 +190,12 @@ class Commander:
 
         Fallback (no ZED depth at lookahead): approximate with near-point deviation.
         """
-        if result.source in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
-            return 0.0
+        # During active cone avoidance the gap waypoint is valid regardless of
+        # Segformer confidence — skip the lane-quality guard so the car steers.
+        avoiding = result.avoidance_state == "AVOIDING" and result.lookahead_point is not None
+        if not avoiding:
+            if result.source in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
+                return 0.0
 
         if result.lookahead_point is not None:
             X_m, Z_m = result.lookahead_point
@@ -203,6 +216,12 @@ class Commander:
             raw_rad = math.atan2(2.0 * WHEELBASE_M * dev, ld * ld)
 
         raw_deg = math.degrees(raw_rad)
+
+        # Heading feed-forward: pre-steer into curves before lateral deviation builds.
+        # heading_angle > 0 means the lane curves left → we need left steer (negative).
+        # This eliminates the "wait until drift" cycle that causes S-swerves on curves.
+        ff_deg  = -math.degrees(result.heading_angle) * HEADING_FF_GAIN
+        raw_deg += ff_deg
 
         # Hardware clamp — only limit at servo physical limit
         return max(-STEER_MAX_DEG, min(STEER_MAX_DEG, raw_deg))
