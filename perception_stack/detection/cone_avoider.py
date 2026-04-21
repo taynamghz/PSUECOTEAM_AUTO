@@ -104,8 +104,8 @@ def _patch_depth(
     r0, r1 = max(0, y - pad), min(H, y + pad + 1)
     c0, c1 = max(0, x - pad), min(W, x + pad + 1)
     patch   = depth_arr[r0:r1, c0:c1]
-    valid   = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
-    return float(np.median(valid)) if valid.size >= 3 else 3.0
+    valid   = patch[np.isfinite(patch) & (patch < -0.1) & (patch > -30.0)]
+    return float(np.median(np.abs(valid))) if valid.size >= 3 else 3.0
 
 
 # ── Background YOLO cone detector ─────────────────────────────────────────────
@@ -368,6 +368,14 @@ class ConeAvoider:
         self._lane_right_ema: float =  2.0
         self._lane_ema_ready: bool  = False
 
+        # Debug state — populated each AVOIDING frame for overlay / logging
+        self._last_cones_cam:  list = []
+        self._last_blocking:   list = []
+        self._last_detections: list = []
+        self._last_gap_X_raw:  float = 0.0
+        self._last_gap_X_ema:  float = 0.0
+        self._last_lane_ema:   tuple = (-2.0, 2.0)
+
     def init(self) -> bool:
         ok = self._detector.init()
         self._enabled = ok
@@ -400,6 +408,24 @@ class ConeAvoider:
             if Z < AVOIDANCE_TRIGGER_M and abs(X) < PATH_WIDTH_M
         ]
         closest_z = min((Z for _, Z in blocking), default=float("inf"))
+
+        # ── Per-frame debug log (all visible cones, not just blocking) ─────────
+        if cones_cam:
+            cone_strs = ["  X={:+.2f}m Z={:.2f}m{}".format(
+                X, Z,
+                " [BLOCKING]" if (Z < AVOIDANCE_TRIGGER_M and abs(X) < PATH_WIDTH_M)
+                else " [side/far]"
+            ) for X, Z in cones_cam]
+            log.debug("[ConeAvoider] frame=%d  %d cone(s) localised:\n%s",
+                      frame_cnt, len(cones_cam), "\n".join(cone_strs))
+        else:
+            log.debug("[ConeAvoider] frame=%d  no cones localised  (dets=%d)",
+                      frame_cnt, len(detections))
+
+        # Store last localised cones for debug_overlay
+        self._last_cones_cam  = cones_cam
+        self._last_blocking   = blocking
+        self._last_detections = detections
 
         # ── State machine ─────────────────────────────────────────────────────
         if self._state == "LANE_FOLLOW" and closest_z < AVOIDANCE_TRIGGER_M:
@@ -442,14 +468,26 @@ class ConeAvoider:
                 self._lane_right_ema = (_LANE_BOUNDS_ALPHA * raw_right
                                         + (1.0 - _LANE_BOUNDS_ALPHA) * self._lane_right_ema)
 
+        # ── Lane bounds debug ─────────────────────────────────────────────────
+        log.debug("[ConeAvoider] lane bounds  raw=(%.2f, %.2f)  ema=(%.2f, %.2f)  "
+                  "width_ema=%.2f m",
+                  raw_left, raw_right,
+                  self._lane_left_ema, self._lane_right_ema,
+                  self._lane_right_ema - self._lane_left_ema)
+
         # ── Gap planning ──────────────────────────────────────────────────────
         gap_X_raw = _find_best_gap(blocking, self._lane_left_ema, self._lane_right_ema)
 
         # EMA on gap target — makes initial steer gentle; car gains FOV and
         # refines target in real time as more of the scene becomes visible
+        prev_gap = self._gap_target
         self._gap_target = (_GAP_TARGET_ALPHA * gap_X_raw
                             + (1.0 - _GAP_TARGET_ALPHA) * self._gap_target)
         gap_X = self._gap_target
+
+        log.debug("[ConeAvoider] gap target  raw=%+.3f m  ema=%+.3f m  "
+                  "(prev_ema=%+.3f)  blocking=%d cone(s)  closest_z=%.2f m",
+                  gap_X_raw, gap_X, prev_gap, len(blocking), closest_z)
 
         # Synthetic lookahead point — same format as compute_lookahead() output
         Z_gap    = GAP_LOOKAHEAD_M
@@ -458,9 +496,134 @@ class ConeAvoider:
         world_pt = (gap_X, Z_gap)
         pixel_pt = (x_px, y_px)
 
+        # Store for overlay
+        self._last_gap_X_raw = gap_X_raw
+        self._last_gap_X_ema = gap_X
+        self._last_lane_ema  = (self._lane_left_ema, self._lane_right_ema)
+
         return world_pt, pixel_pt, "AVOIDING"
 
     @property
     def gap_target(self) -> float:
         """Last selected gap centre X (metres) — for display/telemetry."""
         return self._gap_target
+
+    def debug_overlay(
+        self,
+        frame: np.ndarray,
+        detections: Optional[list] = None,
+        H: int = 0, W: int = 0, fx: float = 700.0,
+    ) -> np.ndarray:
+        """
+        Draw full avoidance debug info onto frame (BGR).  Call every frame from
+        the display path — safe when state is LANE_FOLLOW (draws cones only).
+
+        Draws:
+          • Each YOLO bbox — cyan (side/far) or red (blocking)
+          • Cone label: X, Z distance in metres
+          • Lane boundary lines (EMA) — yellow dashed
+          • All gaps as semi-transparent green bands
+          • Gap target raw X — white dashed vertical
+          • Gap target EMA X — solid green vertical  (the actual lookahead X)
+          • State label top-left
+        """
+        out  = frame.copy()
+        dets = detections if detections is not None else self._last_detections
+        if H == 0:
+            H, W = out.shape[:2]
+        y_near = int(H * SEG_NEAR_FRAC)
+
+        # ── YOLO bboxes + labels ──────────────────────────────────────────────
+        for i, (x1, y1, x2, y2, conf) in enumerate(dets):
+            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+            # Find matching 3D position if available
+            cam_pos = self._last_cones_cam[i] if i < len(self._last_cones_cam) else None
+            is_blocking = cam_pos is not None and any(
+                abs(cam_pos[0] - bx) < 0.01 and abs(cam_pos[1] - bz) < 0.01
+                for bx, bz in self._last_blocking
+            )
+            colour = (0, 0, 220) if is_blocking else (200, 200, 0)   # red / cyan
+            cv2.rectangle(out, (ix1, iy1), (ix2, iy2), colour, 2)
+            if cam_pos:
+                label = "X{:+.2f} Z{:.2f}m".format(cam_pos[0], cam_pos[1])
+            else:
+                label = "conf={:.2f} (no depth)".format(conf)
+            cv2.putText(out, label, (ix1, max(iy1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
+
+        if self._state != "AVOIDING":
+            cv2.putText(out, "LANE_FOLLOW", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2, cv2.LINE_AA)
+            return out
+
+        # ── Lane boundary lines (EMA) ─────────────────────────────────────────
+        left_ema, right_ema = self._last_lane_ema
+        for X_m, col in [(left_ema, (0, 220, 220)), (right_ema, (0, 220, 220))]:
+            x_px = int(np.clip(W / 2.0 + X_m * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+            for y in range(0, H, 16):
+                cv2.line(out, (x_px, y), (x_px, min(y + 8, H - 1)), col, 1)
+
+        # ── Gap bands (semi-transparent green) ───────────────────────────────
+        safe_left  = left_ema  + LANE_MARGIN_M
+        safe_right = right_ema - LANE_MARGIN_M
+        excl = sorted(
+            (X - GAP_CONE_RADIUS_M, X + GAP_CONE_RADIUS_M)
+            for X, _ in self._last_blocking
+        )
+        merged: List[List[float]] = []
+        for lo, hi in excl:
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        cursor = safe_left
+        overlay = out.copy()
+        for lo, hi in merged:
+            if lo > cursor:
+                xl = int(np.clip(W / 2.0 + cursor * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+                xr = int(np.clip(W / 2.0 + lo     * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+                cv2.rectangle(overlay, (xl, y_near - 20), (xr, y_near + 20),
+                              (0, 180, 0), -1)
+            # Draw exclusion zone in red
+            xl_e = int(np.clip(W / 2.0 + lo * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+            xr_e = int(np.clip(W / 2.0 + hi * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+            cv2.rectangle(overlay, (xl_e, y_near - 20), (xr_e, y_near + 20),
+                          (0, 0, 180), -1)
+            cursor = max(cursor, hi)
+        if safe_right > cursor:
+            xl = int(np.clip(W / 2.0 + cursor    * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+            xr = int(np.clip(W / 2.0 + safe_right * fx / GAP_LOOKAHEAD_M, 0, W - 1))
+            cv2.rectangle(overlay, (xl, y_near - 20), (xr, y_near + 20),
+                          (0, 180, 0), -1)
+        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+
+        # ── Gap target lines ──────────────────────────────────────────────────
+        raw_x_px = int(np.clip(W / 2.0 + self._last_gap_X_raw * fx / GAP_LOOKAHEAD_M,
+                               0, W - 1))
+        ema_x_px = int(np.clip(W / 2.0 + self._last_gap_X_ema * fx / GAP_LOOKAHEAD_M,
+                               0, W - 1))
+        # Raw target — white dashed
+        for y in range(0, H, 16):
+            cv2.line(out, (raw_x_px, y), (raw_x_px, min(y + 8, H - 1)),
+                     (255, 255, 255), 1)
+        # EMA target — solid bright green
+        cv2.line(out, (ema_x_px, 0), (ema_x_px, H - 1), (0, 255, 80), 2)
+        cv2.circle(out, (ema_x_px, y_near), 8, (0, 255, 80), -1)
+
+        # ── HUD text ──────────────────────────────────────────────────────────
+        lines = [
+            "AVOIDING",
+            "blocking: {}  closest: {:.2f}m".format(
+                len(self._last_blocking),
+                min((Z for _, Z in self._last_blocking), default=0.0)),
+            "lane EMA: [{:.2f}, {:.2f}]m".format(left_ema, right_ema),
+            "gap raw: {:+.3f}m  ema: {:+.3f}m".format(
+                self._last_gap_X_raw, self._last_gap_X_ema),
+        ]
+        for i, txt in enumerate(lines):
+            col = (0, 80, 255) if i == 0 else (230, 230, 230)
+            cv2.putText(out, txt, (10, 28 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2 if i == 0 else 1,
+                        cv2.LINE_AA)
+
+        return out

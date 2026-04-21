@@ -43,11 +43,13 @@ class TelemetryLogger:
             'steer_deg':  round(steer_deg,             2),
             'speed_kmh':  round(speed_kmh,             2),
             'target_kmh': round(target_kmh,            1),
-            'stop_line':  result.stop_line,
-            'sl_dist':    round(result.stop_line_dist, 2),
-            'stop_sign':  result.stop_sign,
-            'ss_dist':    round(result.stop_sign_dist_m, 2),
-            'cmd':        cmd_state,
+            'stop_line':    result.stop_line,
+            'sl_dist':      round(result.stop_line_dist, 2),
+            'stop_sign':    result.stop_sign,
+            'ss_dist':      round(result.stop_sign_dist_m, 2),
+            'cmd':          cmd_state,
+            'avoidance':    result.avoidance_state,
+            'n_cones':      len(result.cone_detections),
         }
         self._f.write(json.dumps(record) + '\n')
 
@@ -75,8 +77,8 @@ def main():
     print("\nPerception v5 — press Q to quit, I to toggle idle\n")
     if LANE_ENABLED:
         print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | {'Steer':>7} | "
-              f"{'Spd':>6} | {'Tgt':>6} | {'Cmd':>6} | Stop       | Sign")
-        print("-" * 105)
+              f"{'Spd':>6} | {'Tgt':>6} | {'Cmd':>6} | Stop       | Sign      | Avoidance")
+        print("-" * 120)
     else:
         print(f"{'Frame':>6} | {'FPS':>6} | {'Sign':>8} | {'Dist(m)':>8} | {'Cmd':>8}")
         print("-" * 50)
@@ -113,7 +115,9 @@ def main():
                 if _disp_counter % 3 == 0:   # ~10 fps display to reduce CPU load
                     vis = draw(frame, result, fm, perc.H, perc.W,
                                control_cmd, cmd.steer_deg,
-                               cmd.target_kmh, cmd.speed_kmh, _fps_val)
+                               cmd.target_kmh, cmd.speed_kmh, _fps_val,
+                               cone_avoider=perc.cone_avoider,
+                               fx=perc.cal.fx if perc.cal else 700.0)
                     cv2.imshow("PSU Eco Racing", vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
@@ -131,10 +135,16 @@ def main():
                                 if result.stop_line else "-")
                     sign_str = (f"SIGN@{result.stop_sign_dist_m:.2f}m"
                                 if result.stop_sign else "-")
+                    av = result.avoidance_state
+                    gap_str = ""
+                    if av == "AVOIDING" and perc.cone_avoider is not None:
+                        n_blk = len(perc.cone_avoider._last_blocking)
+                        gap_str = (f"AVOIDING  cones={n_blk}"
+                                   f"  gap={perc.cone_avoider._last_gap_X_ema:+.3f}m")
                     print(f"{fc:>6} | {result.source:>12} | "
                           f"{result.deviation_m:>+8.3f} | {cmd.steer_deg:>+6.1f}d | "
                           f"{cmd.speed_kmh:>5.1f}k | {cmd.target_kmh:>5.1f}k | "
-                          f"{control_cmd:>6} | {stop_str:<10} | {sign_str}")
+                          f"{control_cmd:>6} | {stop_str:<10} | {sign_str:<9} | {gap_str}")
                 else:
                     sign_str  = f"{result.stop_sign_dist_m:.2f}m" if result.stop_sign else "--"
                     detected  = "DETECTED" if result.stop_sign else "       -"
