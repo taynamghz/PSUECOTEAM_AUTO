@@ -83,8 +83,8 @@ def _patch_depth(
     r0, r1 = max(0, y - pad), min(H, y + pad + 1)
     c0, c1 = max(0, x - pad), min(W, x + pad + 1)
     patch   = depth_arr[r0:r1, c0:c1]
-    valid   = patch[np.isfinite(patch) & (patch < -0.1) & (patch > -30.0)]
-    return float(np.median(np.abs(valid))) if valid.size >= 3 else 3.0
+    valid   = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
+    return float(np.median(valid)) if valid.size >= 3 else 3.0
 
 
 # ── Background YOLO cone detector ─────────────────────────────────────────────

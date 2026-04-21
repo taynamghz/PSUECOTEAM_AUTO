@@ -81,20 +81,20 @@ BRAKE_VALUE       = 255     # brake intensity byte sent with CMD_BRAKE
 
 # ── Target speed setpoints ────────────────────────────────────────────────────
 # Sent as CMD_THROTTLE DATA byte = int(kmh * 10)  →  e.g. 150 = 15.0 km/h
-SPEED_TARGET_STRAIGHT_KMH = 3.0    # nominal speed on straight sections
-SPEED_TARGET_CURVE_KMH    = 3.0    # reduced speed through corners
+SPEED_TARGET_STRAIGHT_KMH = 4.0    # nominal speed on straight sections
+SPEED_TARGET_CURVE_KMH    = 2.0    # reduced speed through corners
 SPEED_CURVE_THRESH        = 0.15   # |κ| (m⁻¹) above which we slow to curve speed
 
 # ── Lane-following control (Pure Pursuit) ─────────────────────────────────────
 WHEELBASE_M              = 1.6   # vehicle wheelbase — VERIFY before first run
-CTRL_LOOKAHEAD_M         = 4.0   # lookahead distance (metres) — must be ≥ 2×wheelbase to avoid S-swerves
+CTRL_LOOKAHEAD_M         = 2.5   # lookahead distance (metres) — must be ≥ 2×wheelbase to avoid S-swerves
                                   # was 2.2 (too short: near-max steer at 0.5m offset → oscillation)
 CTRL_LANE_DEADBAND_M     = 0.05  # ignore lateral offsets smaller than this (metres)
                                   # was 0.15 — large deadband caused drift→hard-correct→overshoot cycles
 CTRL_HEADING_ALPHA       = 0.20  # EMA alpha for heading angle  (lower = smoother)
 CTRL_CURVATURE_ALPHA     = 0.15  # EMA alpha for curvature      (extra-smooth)
 CTRL_EVAL_Y_FRAC         = 0.60  # image-row fraction to evaluate heading/curvature
-HEADING_FF_GAIN          = 0.40  # feed-forward fraction of heading angle added to Pure Pursuit output
+HEADING_FF_GAIN          = 0.25  # feed-forward fraction of heading angle added to Pure Pursuit output
                                   # pre-steers into curves before lateral deviation builds up
                                   # positive heading_angle = curve-left → negative steer correction
 
@@ -107,8 +107,8 @@ HEADING_FF_GAIN          = 0.40  # feed-forward fraction of heading angle added 
 # 255 = full right (+STEER_MAX_DEG)
 STEER_MAX_DEG           = 25.0  # hardware clamp — servo physical limit
 STEER_DEADBAND_DEG      = 2.0   # ignore corrections smaller than this (mask noise)
-STEER_RATE_LIMIT_DEG    = 5.0   # max change per frame — prevents jolts from bad Segformer frames
-STEER_EMA_ALPHA         = 0.20  # EMA weight — lower = smoother, higher = more responsive
+STEER_RATE_LIMIT_DEG    = 2.0   # max change per frame — prevents jolts from bad Segformer frames
+STEER_EMA_ALPHA         = 0.40  # EMA weight — lower = smoother, higher = more responsive
 STEER_TX_DEADBAND_DEG   = 1.5   # only transmit CMD_STEER if angle changed by more than
                                  # this from the last SENT value.
 
@@ -143,8 +143,8 @@ LOG_DIR            = "logs"
 # On curves we submit every SEG_SKIP_CURVE frames for maximum steering freshness.
 # Detection of straight vs. curve uses the smoothed curvature from the last result.
 # (This reduces GPU usage and power draw on straights — critical for eco-marathon.)
-SEG_SKIP_STRAIGHT = 1   # submit every frame — always fresh lane data
-SEG_SKIP_CURVE    = 1   # submit every frame on curves (full inference rate)
+SEG_SKIP_STRAIGHT = 4   # submit every frame — always fresh lane data
+SEG_SKIP_CURVE    = 2   # submit every frame on curves (full inference rate)
 
 # ── Segformer drivable-area lane detection ─────────────────────────────────────
 # Priority: TRT engine → ONNX Runtime → HuggingFace (slowest fallback)
@@ -182,19 +182,19 @@ GRASS_FRAC_THRESH   = 0.50  # fraction of inner strip that must be grass to trig
 GRASS_MAX_TRIM_FRAC = 0.20  # max boundary trim as fraction of current lane width
 
 # ── Perception safety ──────────────────────────────────────────────────────────
-LOST_BRAKE_ENABLED = True   # set False to disable emergency brake on lost road (testing)
+LOST_BRAKE_ENABLED = False  # set False to disable emergency brake on lost road (testing)
 LOST_BRAKE_FRAMES  = 15     # consecutive LOST frames before brake triggers (~500 ms at 30 fps)
 
 # ── Stop-sign detection ────────────────────────────────────────────────────────
 # Set False to disable entirely (no GPU, no thread, no brake from sign)
-STOP_SIGN_ENABLED = True
+STOP_SIGN_ENABLED = False
 
 # ── Cone avoidance ────────────────────────────────────────────────────────────
 # Set False to run pure lane-following with no cone awareness
 CONE_AVOIDANCE_ENABLED = True
 
 # YOLOv5 cone model
-CONE_MODEL_PATH    = "perception_stack/weights/cones.pt"
+CONE_MODEL_PATH    = "/home/rasd/psu_racing/best (cones).pt"
 CONE_CONF_THRESH   = 0.40
 CONE_IMG_SIZE      = 416
 CONE_SKIP_FRAMES   = 2          # run YOLO every N frames (budget control)
@@ -209,13 +209,13 @@ CONE_Z_MAX_M       = 8.0
 # Cones to the side of the road are ignored entirely.
 AVOIDANCE_TRIGGER_M = 5.0       # engage when a blocking cone enters this range
 AVOIDANCE_RELEASE_M = 6.5       # release only when ALL blocking cones exit this range
-PATH_WIDTH_M        = 1.0       # lateral half-corridor that counts as "blocking"
+PATH_WIDTH_M        = 1.2       # lateral half-corridor that counts as "blocking"
 RETURN_BAND_M       = 0.20      # also require actual deviation < this before releasing
 
 # Gap planner geometry
 GAP_CAR_WIDTH_M     = 1.20      # full vehicle width — measured physically
 GAP_CONE_RADIUS_M   = 0.15      # treat each cone as a cylinder of this radius
-GAP_LOOKAHEAD_M     = 1.8       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
+GAP_LOOKAHEAD_M     = 1.6       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
 GAP_CENTER_WEIGHT   = 0.40      # score penalty for gaps away from lane centre
 LANE_MARGIN_M       = 0.10      # min distance from grass edge for gap targets (loose — tunable)
 

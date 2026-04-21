@@ -119,6 +119,30 @@ def draw(frame: np.ndarray, result: PerceptionResult,
         cv2.putText(vis, "ROAD MASK", (px + 4, py + PH - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
+    # ── Cone detections ───────────────────────────────────────────────────────
+    if result.cone_detections:
+        avoiding = result.avoidance_state == "AVOIDING"
+        box_col  = (0, 60, 255) if avoiding else (0, 165, 255)
+        for x1, y1, x2, y2, conf in result.cone_detections:
+            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(vis, (ix1, iy1), (ix2, iy2), box_col, 2)
+            cv2.putText(vis, f"{conf:.2f}", (ix1, iy1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_col, 2)
+    if result.avoidance_state == "AVOIDING":
+        av_label = "AVOIDING CONE"
+        lsz = cv2.getTextSize(av_label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+        tx = W // 2 - lsz[0] // 2
+        cv2.rectangle(vis, (tx - 8, 95), (tx + lsz[0] + 8, 95 + lsz[1] + 12),
+                      (0, 0, 180), -1)
+        cv2.putText(vis, av_label, (tx, 95 + lsz[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 60, 255), 2)
+
+    # ── Gap target waypoint ───────────────────────────────────────────────────
+    if result.avoidance_state == "AVOIDING" and result.lookahead_pixel is not None:
+        gx, gy = result.lookahead_pixel
+        cv2.drawMarker(vis, (gx, gy), (0, 60, 255), cv2.MARKER_CROSS, 20, 2)
+        cv2.circle(vis, (gx, gy), 10, (0, 60, 255), 2)
+
     # ── Stop line ─────────────────────────────────────────────────────────────
     if result.stop_line and result.stop_line_y is not None:
         sy = result.stop_line_y

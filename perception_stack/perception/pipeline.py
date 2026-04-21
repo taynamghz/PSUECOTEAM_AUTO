@@ -91,12 +91,16 @@ class LanePerception:
         # Used by compute_lookahead for accurate steering: 3.7 MB vs 11 MB for XYZ.
         self._depth_cache: Optional[np.ndarray] = None
         self._depth_age:   int                  = PC_REFRESH_EVERY  # force fetch frame 1
+        self.depth_arr:    Optional[np.ndarray] = None  # public: latest depth, for cone avoidance
 
         # Full XYZ cache — only retrieved when stop-line/sign detection is active.
         self._pc_cache: Optional[np.ndarray] = None
 
         # Consecutive LOST-source frame counter — triggers emergency_stop after threshold
         self._lost_frame_cnt: int = 0
+
+        # Pose — updated every frame; public so cone avoidance can read it.
+        self.pose = sl.Pose()
 
         # Rolling frame-time buffer for FPS monitoring
         self._frame_times: collections.deque = collections.deque(maxlen=30)
@@ -236,6 +240,7 @@ class LanePerception:
         lookahead_world = lookahead_px = None
         source          = "DISABLED"
         avoidance_state = "LANE_FOLLOW"
+        cone_dets       = []
 
         if LANE_ENABLED:
             # ── Segformer — adaptive submission rate ──────────────────────────
@@ -334,6 +339,7 @@ class LanePerception:
                     frame_norm, self._depth_cache, road_mask_bool,
                     dev, self.H, self.W, self.cal.fx, self.frame_cnt,
                 )
+                cone_dets = self.cone_avoider._detector.get_result()
                 if av_world is not None:
                     lookahead_world = av_world
                     lookahead_px    = av_px
@@ -391,6 +397,7 @@ class LanePerception:
             emergency_stop   = (LANE_ENABLED and LOST_BRAKE_ENABLED
                                 and self._lost_frame_cnt >= LOST_BRAKE_FRAMES),
             avoidance_state  = avoidance_state,
+            cone_detections  = cone_dets,
         ), frame, fm
 
     def close(self):

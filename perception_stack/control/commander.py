@@ -42,7 +42,7 @@ def _deg_to_steer_byte(deg: float) -> int:
     positive deg = steer right → byte > 127
     negative deg = steer left  → byte < 127
     """
-    return int(max(0, min(255, round(127.0 + deg * 127.0 / STEER_MAX_DEG))))
+    return int(max(0, min(255, round(127.0 - deg * 127.0 / STEER_MAX_DEG))))
 
 
 class Commander:

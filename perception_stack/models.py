@@ -3,8 +3,8 @@ PSU Eco Racing — Perception Stack
 models.py  |  Shared data structures passed between modules and to the controller.
 """
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 import numpy as np
 
 
@@ -42,3 +42,6 @@ class PerceptionResult:
     # ── Safety ────────────────────────────────────────────────────────────────
     emergency_stop:  bool = False          # True when LOST for > LOST_BRAKE_FRAMES consecutive frames
     avoidance_state: str  = "LANE_FOLLOW"  # LANE_FOLLOW | AVOIDING
+
+    # ── Cone avoidance ────────────────────────────────────────────────────────
+    cone_detections: List = field(default_factory=list)  # [(x1,y1,x2,y2,conf), ...] raw YOLO bboxes
