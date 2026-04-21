@@ -13,16 +13,31 @@ Gap planning (exclusion-zone merging):
   Every visible cone occupies a lateral interval [X - CONE_RADIUS, X + CONE_RADIUS].
   Overlapping intervals are merged → single combined obstacle.
   Passable gaps are the intervals of the drivable corridor NOT covered by any obstacle.
-  Best gap = widest gap, tie-broken toward lane centre (X = 0).
+  Best gap scored by width and centrality — never rejected for being narrow.
+
+  Target within each gap: minimum-deviation clearance point, not midpoint.
+    For a gap [gl, gr], the car needs at least half its width clear of each edge:
+      lo = gl + GAP_CAR_WIDTH_M/2,  hi = gr - GAP_CAR_WIDTH_M/2
+    If lo < hi the target is clip(0, lo, hi) — stays as close to X=0 as possible.
+    If lo >= hi (gap narrower than car) the target is the midpoint — best effort.
+    This prevents a single side-cone from pulling the target to the far edge of the
+    corridor (which used to cause 25° steer and near-grass targets).
 
   Grass-awareness: lane boundaries come from the Segformer road_mask AFTER the
-  road_validator has already trimmed grass pixels inward.  The gap target is therefore
-  clamped inside the validated drivable area — the car cannot be steered into grass.
+  road_validator has already trimmed grass pixels inward.  Additionally, lane
+  bounds are EMA-smoothed across frames so a momentary narrow FOV during turning
+  (car rotated right → left boundary temporarily off-screen) does not collapse
+  the planning corridor — the planner remembers the real lane width.
+
+  Gap target is also EMA-smoothed: the car makes a gentle initial turn, gains FOV,
+  and refines the gap target in real time as more of the scene becomes visible.
 
   Handles any cone arrangement:
-    single cone dead-centre  → two gaps, picks wider side
-    two cones forming a slot → threads through the slot
+    single cone dead-centre  → two gaps, picks wider side, target near centre
+    two cones forming a slot → threads minimum-deviation path through slot
     two cones side-by-side   → merged into one obstacle, goes around
+    cone near lane edge      → gap on that side has very small clearance room;
+                               target clips to minimum clearance → other side wins
     cone to the side of road → |X| > PATH_WIDTH_M → ignored, no avoidance
 
 State machine:
@@ -59,6 +74,7 @@ from perception_stack.config import (
     AVOIDANCE_RELEASE_M,
     PATH_WIDTH_M,
     RETURN_BAND_M,
+    GAP_CAR_WIDTH_M,
     GAP_CONE_RADIUS_M,
     GAP_LOOKAHEAD_M,
     GAP_CENTER_WEIGHT,
@@ -66,6 +82,11 @@ from perception_stack.config import (
     SEG_NEAR_FRAC,
     ROI_TOP_FRACTION,
 )
+
+# EMA smoothing for lane bounds (preserves corridor width during mid-turn FOV loss)
+_LANE_BOUNDS_ALPHA = 0.25   # low = slow to update → stable during turning
+# EMA smoothing for gap target (gentle initial steer → refines as FOV widens)
+_GAP_TARGET_ALPHA  = 0.35   # higher = more responsive; lower = smoother transitions
 
 log = logging.getLogger(__name__)
 
@@ -217,26 +238,38 @@ def _lane_bounds_m(
 
 # ── Exclusion-zone gap planner ────────────────────────────────────────────────
 
+def _clearance_target(gl: float, gr: float) -> float:
+    """
+    Minimum-deviation X inside [gl, gr] that keeps the car clear of both edges.
+    Stays as close to X=0 (lane centre) as the gap geometry allows.
+    Falls back to midpoint when the gap is narrower than the car (best effort).
+    """
+    half = GAP_CAR_WIDTH_M / 2.0
+    lo   = gl + half
+    hi   = gr - half
+    if lo >= hi:
+        return (gl + gr) / 2.0   # gap too narrow for car — best-effort midpoint
+    return float(np.clip(0.0, lo, hi))
+
+
 def _find_best_gap(
     blocking_cones: List[Tuple[float, float]],
     left_X_m: float,
     right_X_m: float,
 ) -> float:
     """
-    Find the centre X (metres) of the best gap through the cone field.
+    Find the best X target (metres) through the cone field.
 
-    Never rejects a gap for being too narrow — always returns a target so the
-    car is always steering toward the best available option in real time.
-    Width is used only for scoring, not as a hard filter.
+    Uses clearance-target (not midpoint): within each gap the car aims for the
+    point closest to X=0 that still keeps it clear of both gap edges.
+    This means:
+      - A cone near the right lane edge leaves a large left gap → target stays
+        near X=0, not at the far-left midpoint.
+      - A cone near centre splits the corridor → car takes minimum-deviation
+        path through whichever gap it picks, rather than over-steering to edge.
 
-    Algorithm:
-      1. Each cone occupies [X - GAP_CONE_RADIUS_M, X + GAP_CONE_RADIUS_M].
-      2. Overlapping intervals are merged into combined obstacles.
-      3. Every open interval of [safe_left, safe_right] becomes a gap candidate.
-      4. Score = width - GAP_CENTER_WEIGHT × |centre| — wider and more central wins.
-      5. If no open interval exists (cones span full corridor), picks widest
-         interval between merged obstacles as best effort.
-      6. Target is clamped to [safe_left, safe_right] — stays on asphalt.
+    Never rejects a gap — width is used for scoring only.
+    If no open gaps exist (cones span full corridor) → widest obstacle interval.
     """
     safe_left  = left_X_m  + LANE_MARGIN_M
     safe_right = right_X_m - LANE_MARGIN_M
@@ -245,7 +278,7 @@ def _find_best_gap(
         return 0.0
 
     if safe_right <= safe_left:
-        return (left_X_m + right_X_m) / 2.0   # no margin room — aim for centre
+        return (left_X_m + right_X_m) / 2.0
 
     # Build and merge exclusion intervals
     exclusions = sorted(
@@ -259,41 +292,44 @@ def _find_best_gap(
         else:
             merged.append([lo, hi])
 
-    # Collect ALL open intervals — no minimum width filter
-    gaps: List[Tuple[float, float, float]] = []   # (gl, gr, centre)
+    # Collect ALL open intervals with their clearance targets
+    gaps: List[Tuple[float, float, float]] = []   # (gl, gr, clearance_target)
     cursor = safe_left
     for lo, hi in merged:
         if lo > cursor:
-            gaps.append((cursor, lo, (cursor + lo) / 2.0))
+            ct = _clearance_target(cursor, lo)
+            gaps.append((cursor, lo, ct))
         cursor = max(cursor, hi)
     if safe_right > cursor:
-        gaps.append((cursor, safe_right, (cursor + safe_right) / 2.0))
+        ct = _clearance_target(cursor, safe_right)
+        gaps.append((cursor, safe_right, ct))
 
     if not gaps:
-        # Cones span entire corridor — pick widest interval between obstacles
-        cursor  = safe_left
-        best_w  = 0.0
-        best_c  = (safe_left + safe_right) / 2.0
+        # All gaps blocked — pick widest interval between merged obstacles
+        cursor = safe_left
+        best_w = 0.0
+        best_t = (safe_left + safe_right) / 2.0
         for lo, hi in merged:
             if lo > cursor:
                 w = lo - cursor
                 if w > best_w:
-                    best_w, best_c = w, (cursor + lo) / 2.0
+                    best_w = w
+                    best_t = _clearance_target(cursor, lo)
             cursor = max(cursor, hi)
         if safe_right > cursor and (safe_right - cursor) > best_w:
-            best_c = (cursor + safe_right) / 2.0
-        return float(np.clip(best_c, safe_left, safe_right))
+            best_t = _clearance_target(cursor, safe_right)
+        return float(np.clip(best_t, safe_left, safe_right))
 
-    # Score every gap — pick highest
-    best_centre = 0.0
+    # Score by gap width + centrality of clearance target — pick highest
+    best_target = 0.0
     best_score  = float("-inf")
-    for gl, gr, gc in gaps:
-        score = (gr - gl) - GAP_CENTER_WEIGHT * abs(gc)
+    for gl, gr, ct in gaps:
+        score = (gr - gl) - GAP_CENTER_WEIGHT * abs(ct)
         if score > best_score:
             best_score  = score
-            best_centre = gc
+            best_target = ct
 
-    return float(np.clip(best_centre, safe_left, safe_right))
+    return float(np.clip(best_target, safe_left, safe_right))
 
 
 # ── Stateful avoidance planner ─────────────────────────────────────────────────
@@ -326,6 +362,11 @@ class ConeAvoider:
         self._enabled    = False
         self._state      = "LANE_FOLLOW"
         self._gap_target: float = 0.0
+
+        # EMA of lane boundaries — persists real corridor width when turning narrows FOV
+        self._lane_left_ema:  float = -2.0
+        self._lane_right_ema: float =  2.0
+        self._lane_ema_ready: bool  = False
 
     def init(self) -> bool:
         ok = self._detector.init()
@@ -369,18 +410,46 @@ class ConeAvoider:
             all_clear      = closest_z > AVOIDANCE_RELEASE_M
             back_to_centre = abs(dev_m) < RETURN_BAND_M   # actual car position, not target
             if all_clear and back_to_centre:
-                self._state     = "LANE_FOLLOW"
-                self._gap_target = 0.0
+                self._state          = "LANE_FOLLOW"
+                self._gap_target     = 0.0
+                self._lane_ema_ready = False   # re-seed lane bounds fresh next avoidance
                 log.info("[ConeAvoider] Path clear — resuming lane follow")
 
         if self._state != "AVOIDING":
             return None, None, "LANE_FOLLOW"
 
+        # ── Lane bounds — EMA-smoothed ────────────────────────────────────────
+        # Fresh reading from grass-validated Segformer mask.
+        # When the car turns mid-avoidance the opposite boundary can leave FOV
+        # (reads -2.0 / +2.0 fallback).  The EMA keeps the remembered real width
+        # so the gap planner doesn't suddenly think the corridor expanded to ±2 m
+        # OR collapsed to a narrow slice — both cause wrong gap targets.
+        raw_left, raw_right = _lane_bounds_m(road_mask, depth_arr, H, W, fx)
+        fallback_left  = -2.0
+        fallback_right =  2.0
+        if not self._lane_ema_ready:
+            # First frame: seed EMA with whatever we have (prefer real reading)
+            self._lane_left_ema  = raw_left  if raw_left  != fallback_left  else -1.5
+            self._lane_right_ema = raw_right if raw_right != fallback_right else  1.5
+            self._lane_ema_ready = True
+        else:
+            # Only blend in the fresh reading if it looks like a real measurement
+            # (not the -2/+2 fallback that fires when the mask row is empty)
+            if raw_left != fallback_left:
+                self._lane_left_ema = (_LANE_BOUNDS_ALPHA * raw_left
+                                       + (1.0 - _LANE_BOUNDS_ALPHA) * self._lane_left_ema)
+            if raw_right != fallback_right:
+                self._lane_right_ema = (_LANE_BOUNDS_ALPHA * raw_right
+                                        + (1.0 - _LANE_BOUNDS_ALPHA) * self._lane_right_ema)
+
         # ── Gap planning ──────────────────────────────────────────────────────
-        # Lane bounds come from grass-validated Segformer mask → target stays on asphalt
-        left_X, right_X  = _lane_bounds_m(road_mask, depth_arr, H, W, fx)
-        gap_X            = _find_best_gap(blocking, left_X, right_X)
-        self._gap_target = gap_X
+        gap_X_raw = _find_best_gap(blocking, self._lane_left_ema, self._lane_right_ema)
+
+        # EMA on gap target — makes initial steer gentle; car gains FOV and
+        # refines target in real time as more of the scene becomes visible
+        self._gap_target = (_GAP_TARGET_ALPHA * gap_X_raw
+                            + (1.0 - _GAP_TARGET_ALPHA) * self._gap_target)
+        gap_X = self._gap_target
 
         # Synthetic lookahead point — same format as compute_lookahead() output
         Z_gap    = GAP_LOOKAHEAD_M
