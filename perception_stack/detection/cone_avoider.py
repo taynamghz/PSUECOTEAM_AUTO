@@ -478,11 +478,17 @@ class ConeAvoider:
         # ── Gap planning ──────────────────────────────────────────────────────
         gap_X_raw = _find_best_gap(blocking, self._lane_left_ema, self._lane_right_ema)
 
-        # EMA on gap target — makes initial steer gentle; car gains FOV and
-        # refines target in real time as more of the scene becomes visible
+        # EMA on gap target — smooths same-side jitter but snaps immediately
+        # when the best gap switches sides.  Blending through zero would steer
+        # toward the wrong side for several frames while the EMA crossed over.
         prev_gap = self._gap_target
-        self._gap_target = (_GAP_TARGET_ALPHA * gap_X_raw
-                            + (1.0 - _GAP_TARGET_ALPHA) * self._gap_target)
+        side_switched = (gap_X_raw * self._gap_target < 0.0
+                         and abs(gap_X_raw) > 0.10)
+        if side_switched:
+            self._gap_target = gap_X_raw   # snap — never blend across zero
+        else:
+            self._gap_target = (_GAP_TARGET_ALPHA * gap_X_raw
+                                + (1.0 - _GAP_TARGET_ALPHA) * self._gap_target)
         gap_X = self._gap_target
 
         log.debug("[ConeAvoider] gap target  raw=%+.3f m  ema=%+.3f m  "
