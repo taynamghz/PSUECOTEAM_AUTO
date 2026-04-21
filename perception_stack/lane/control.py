@@ -144,10 +144,10 @@ def compute_lookahead(
         r0, r1 = max(0, y_look - pad), min(H, y_look + pad + 1)
         c0, c1 = max(0, cx_int  - pad), min(W, cx_int  + pad + 1)
         patch = depth_arr[r0:r1, c0:c1]
-        # ZED RIGHT_HANDED_Y_UP: forward = −Z  (objects ahead have negative Z)
-        valid = patch[np.isfinite(patch) & (patch < -0.1) & (patch > -30.0)]
+        # sl.MEASURE.DEPTH returns positive distances regardless of coordinate system
+        valid = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
         if valid.size >= 4:
-            Z_m = float(np.median(np.abs(valid)))
+            Z_m = float(np.median(valid))
 
     X_m      = (cx - W / 2.0) * Z_m / fx
     pixel_pt = (cx_int, y_look)

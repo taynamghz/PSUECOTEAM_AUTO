@@ -84,7 +84,7 @@ from perception_stack.config import (
 )
 
 # EMA smoothing for lane bounds (preserves corridor width during mid-turn FOV loss)
-_LANE_BOUNDS_ALPHA = 0.25   # low = slow to update → stable during turning
+_LANE_BOUNDS_ALPHA = 0.45   # tracks actual lane width faster → less bias in gap scoring
 # EMA smoothing for gap target (gentle initial steer → refines as FOV widens)
 _GAP_TARGET_ALPHA  = 0.35   # higher = more responsive; lower = smoother transitions
 
@@ -104,8 +104,8 @@ def _patch_depth(
     r0, r1 = max(0, y - pad), min(H, y + pad + 1)
     c0, c1 = max(0, x - pad), min(W, x + pad + 1)
     patch   = depth_arr[r0:r1, c0:c1]
-    valid   = patch[np.isfinite(patch) & (patch < -0.1) & (patch > -30.0)]
-    return float(np.median(np.abs(valid))) if valid.size >= 3 else 3.0
+    valid   = patch[np.isfinite(patch) & (patch > 0.1) & (patch < 30.0)]
+    return float(np.median(valid)) if valid.size >= 3 else 3.0
 
 
 # ── Background YOLO cone detector ─────────────────────────────────────────────

@@ -216,7 +216,7 @@ RETURN_BAND_M       = 0.20      # also require actual deviation < this before re
 GAP_CAR_WIDTH_M     = 1.20      # full vehicle width — measured physically
 GAP_CONE_RADIUS_M   = 0.15      # treat each cone as a cylinder of this radius
 GAP_LOOKAHEAD_M     = 1.6       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
-GAP_CENTER_WEIGHT   = 0.40      # score penalty for gaps away from lane centre
+GAP_CENTER_WEIGHT   = 0.20      # score penalty for gaps away from lane centre — width dominates
 LANE_MARGIN_M       = 0.10      # min distance from grass edge for gap targets (loose — tunable)
 
 # Speed during avoidance — slow for precise manoeuvring
