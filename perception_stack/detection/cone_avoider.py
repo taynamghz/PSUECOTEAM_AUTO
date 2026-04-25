@@ -28,7 +28,7 @@ Gap planning:
 State machine (#7 — three states):
   LANE_FOLLOW → AVOIDING   when a blocking cone enters AVOIDANCE_TRIGGER_M
   AVOIDING    → RETURNING  when ALL cones exit AVOIDANCE_RELEASE_M
-  RETURNING   → LANE_FOLLOW when |dev_m| < RETURN_BAND_M OR after 90-frame timeout
+  RETURNING   → LANE_FOLLOW when |dev_m| < RETURN_BAND_M OR after 40-frame timeout
                              (RETURNING actively steers to X=0 via Pure Pursuit)
 """
 
@@ -400,7 +400,7 @@ class ConeAvoider:
         elif self._state == "RETURNING":
             self._return_frames += 1
             centred   = abs(dev_m) < RETURN_BAND_M
-            timed_out = self._return_frames > 90   # 3 s at 30 fps
+            timed_out = self._return_frames > 40   # 3 s at 30 fps
             if centred or timed_out:
                 self._state          = "LANE_FOLLOW"
                 self._lane_ema_ready = False
@@ -544,7 +544,7 @@ class ConeAvoider:
         # ── RETURNING state display ───────────────────────────────────────────
         if self._state == "RETURNING":
             cv2.line(out, (W // 2, 0), (W // 2, H), (0, 200, 255), 2)
-            cv2.putText(out, "RETURNING  frame {}/90".format(self._return_frames),
+            cv2.putText(out, "RETURNING  frame {}/40".format(self._return_frames),
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 200, 255), 2, cv2.LINE_AA)
             return out
