@@ -47,7 +47,7 @@ LANE_ENABLED = True
 # Export: python scripts/export_trt.py  (TensorRT FP16 for Jetson)
 # Use .engine path after export; .pt works for development without TRT
 SIGN_MODEL_PATH      = "/home/rasd/psu_racing/best.pt"  # TensorRT FP16 — built on this Jetson
-SIGN_CONF_THRESH     = 0.70
+SIGN_CONF_THRESH     = 0.55
 SIGN_IMG_SIZE        = 416
 SIGN_ACCEPT_CLASSES  = {0, 2}    # 0=stop-sign  2=stop-sign-vandalized
 SIGN_SKIP_FRAMES     = 3         # run YOLO every N frames; cache between
@@ -182,7 +182,7 @@ LOST_BRAKE_FRAMES  = 15     # consecutive LOST frames before brake triggers (~50
 
 # ── Stop-sign detection ────────────────────────────────────────────────────────
 # Set False to disable entirely (no GPU, no thread, no brake from sign)
-STOP_SIGN_ENABLED = True
+STOP_SIGN_ENABLED = False
 
 # ── Cone avoidance ────────────────────────────────────────────────────────────
 # Set False to run pure lane-following with no cone awareness
@@ -190,7 +190,7 @@ CONE_AVOIDANCE_ENABLED = True
 
 # YOLOv5 cone model
 CONE_MODEL_PATH    = "/home/rasd/psu_racing/best (cones).pt"
-CONE_CONF_THRESH   = 0.40
+CONE_CONF_THRESH   = 0.35
 CONE_IMG_SIZE      = 416
 CONE_SKIP_FRAMES   = 2          # run YOLO every N frames (budget control)
 
@@ -208,11 +208,11 @@ PATH_WIDTH_M        = 1.2      # lateral half-corridor that counts as "blocking"
 RETURN_BAND_M       = 0.12      # also require actual deviation < this before releasing
 
 # Gap planner geometry
-GAP_CAR_WIDTH_M     = 1.2       # full vehicle width — measured physically
-GAP_CONE_RADIUS_M   = 0.15     # treat each cone as a cylinder of this radius
-GAP_LOOKAHEAD_M     = 2.2       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
-GAP_CENTER_WEIGHT   = 0.40      # score penalty for gaps away from lane centre
-LANE_MARGIN_M       = 0.15    # min distance from grass edge for gap targets (loose — tunable)
+GAP_CAR_WIDTH_M     = 1.4      # full vehicle width — measured physically
+GAP_CONE_RADIUS_M   = 0.18     # treat each cone as a cylinder of this radius
+GAP_LOOKAHEAD_M     = 2.4       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
+GAP_CENTER_WEIGHT   = 0.35      # score penalty for gaps away from lane centre
+LANE_MARGIN_M       = 0.10    # min distance from grass edge for gap targets (loose — tunable)
 
 # Speed during avoidance — slow for precise manoeuvring
-SPEED_AVOID_KMH     = 0.7
+SPEED_AVOID_KMH     = 0.9
