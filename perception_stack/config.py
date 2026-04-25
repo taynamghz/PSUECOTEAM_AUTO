@@ -47,23 +47,16 @@ LANE_ENABLED = True
 # Export: python scripts/export_trt.py  (TensorRT FP16 for Jetson)
 # Use .engine path after export; .pt works for development without TRT
 SIGN_MODEL_PATH      = "/home/rasd/psu_racing/best.pt"  # TensorRT FP16 — built on this Jetson
-SIGN_CONF_THRESH     = 0.40
+SIGN_CONF_THRESH     = 0.70
 SIGN_IMG_SIZE        = 416
 SIGN_ACCEPT_CLASSES  = {0, 2}    # 0=stop-sign  2=stop-sign-vandalized
 SIGN_SKIP_FRAMES     = 3         # run YOLO every N frames; cache between
 SIGN_DIST_MIN_M      = 0.5
 SIGN_DIST_MAX_M      = 15.0
 SIGN_VOTE_NEEDED     = 3         # consecutive detections before confirming
-# SEM-specific: sign sits on a yellow rectangular board
-SIGN_YELLOW_H_MIN    = 18        # HSV hue range for SEM yellow board
-SIGN_YELLOW_H_MAX    = 38
-SIGN_YELLOW_S_MIN    = 120
-SIGN_YELLOW_V_MIN    = 150
-SIGN_YELLOW_ROI_FRAC  = 1.3      # expand bbox by this factor when sampling yellow
-SIGN_YELLOW_AREA_FRAC = 0.12     # minimum yellow fraction in expanded roi
-SIGN_FY_APPROX        = 730      # approx. vertical focal length at 720p (px)qqqqqqq
+SIGN_FY_APPROX        = 730      # approx. vertical focal length at 720p (px)
 SIGN_HEIGHT_M         = 0.65     # assumed sign height (m)
-SIGN_BBOX_MIN_FRAC    = 0.35     # bbox height must be ≥ this fraction of expected px height
+SIGN_BBOX_MIN_FRAC    = 0.35     # bbox height must be >= this fraction of expected px height
 
 # ── UART / low-level controller ────────────────────────────────────────────────
 UART_ENABLED       = True
@@ -71,12 +64,13 @@ UART_PORT          = "/dev/ttyTHS1"   # Jetson hardware UART; /dev/ttyUSB0 on PC
 UART_BAUD          = 115200
 UART_TIMEOUT_S     = 0.01
 UART_ACK_TIMEOUT_S = 0.05
-UART_HEARTBEAT_S   = 0.080   # force retransmit every 80ms — keeps Nucleo watchdog alive
+UART_HEARTBEAT_S   = 0.080   # force retransmit every 80ms -- keeps Nucleo watchdog alive
 
 # ── Vehicle commands ────────────────────────────────────────────────────────────
 # The Nucleo runs a PID controller internally.
 # Jetson sends ONLY the setpoints; Nucleo handles throttle, braking, and PWM.
-STOP_BRAKE_DIST_M = 3.5     # stop-line/sign within this distance → send CMD_BRAKE
+STOP_BRAKE_DIST_M      = 3.5   # stop-line within this distance -> send CMD_BRAKE
+STOP_SIGN_BRAKE_DIST_M = 2.0   # stop-sign within this distance -> send CMD_BRAKE
 BRAKE_VALUE       = 255     # brake intensity byte sent with CMD_BRAKE
 
 # ── Target speed setpoints ────────────────────────────────────────────────────
@@ -134,6 +128,7 @@ FPS_WARN_BELOW     = 20.0
 
 # ── Telemetry logging ──────────────────────────────────────────────────────────
 LOG_TELEMETRY      = True
+LOG_UART_CMDS      = True   # write every UART TX to logs/uart_YYYYMMDD_HHMMSS.jsonl
 LOG_DIR            = "logs"
 
 # ── Adaptive Segformer submission rate ────────────────────────────────────────
@@ -207,17 +202,17 @@ CONE_Z_MAX_M       = 8.0
 # Avoidance trigger / release
 # A cone must be inside the forward corridor (|X| < PATH_WIDTH_M) AND close in Z.
 # Cones to the side of the road are ignored entirely.
-AVOIDANCE_TRIGGER_M = 5.0       # engage when a blocking cone enters this range
+AVOIDANCE_TRIGGER_M = 5.5       # engage when a blocking cone enters this range
 AVOIDANCE_RELEASE_M = 6.5       # release only when ALL blocking cones exit this range
-PATH_WIDTH_M        = 1.5      # lateral half-corridor that counts as "blocking"
-RETURN_BAND_M       = 0.20      # also require actual deviation < this before releasing
+PATH_WIDTH_M        = 1.2      # lateral half-corridor that counts as "blocking"
+RETURN_BAND_M       = 0.12      # also require actual deviation < this before releasing
 
 # Gap planner geometry
-GAP_CAR_WIDTH_M     = 1.4       # full vehicle width — measured physically
-GAP_CONE_RADIUS_M   = 0.18      # treat each cone as a cylinder of this radius
+GAP_CAR_WIDTH_M     = 1.2       # full vehicle width — measured physically
+GAP_CONE_RADIUS_M   = 0.15     # treat each cone as a cylinder of this radius
 GAP_LOOKAHEAD_M     = 2.2       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
-GAP_CENTER_WEIGHT   = 0.20      # score penalty for gaps away from lane centre
-LANE_MARGIN_M       = 0.10      # min distance from grass edge for gap targets (loose — tunable)
+GAP_CENTER_WEIGHT   = 0.40      # score penalty for gaps away from lane centre
+LANE_MARGIN_M       = 0.15    # min distance from grass edge for gap targets (loose — tunable)
 
 # Speed during avoidance — slow for precise manoeuvring
-SPEED_AVOID_KMH     = 1.0
+SPEED_AVOID_KMH     = 0.7

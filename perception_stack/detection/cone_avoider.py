@@ -228,9 +228,9 @@ class TrackWidthEstimator:
 
 # ── Exclusion-zone gap planner ────────────────────────────────────────────────
 
-def _clearance_target(gl: float, gr: float) -> float:
+def _clearance_target(gl: float, gr: float, lane_center_X: float = 0.0) -> float:
     """
-    Minimum-deviation X inside [gl, gr] that keeps the car clear of both edges.
+    Closest X to lane_center_X inside [gl, gr] that keeps the car clear of both edges.
     Falls back to midpoint when the gap is narrower than the car.
     """
     half = GAP_CAR_WIDTH_M / 2.0
@@ -238,23 +238,25 @@ def _clearance_target(gl: float, gr: float) -> float:
     hi   = gr - half
     if lo >= hi:
         return (gl + gr) / 2.0
-    return float(np.clip(0.0, lo, hi))
+    return float(np.clip(lane_center_X, lo, hi))
 
 
 def _find_best_gap(
     blocking_cones: List[Tuple[float, float, float]],   # (X_m, Z_m, conf)
     left_X_m: float,
     right_X_m: float,
+    lane_center_X: float = 0.0,
 ) -> float:
     """
     Best gap clearance-target X through the (priority) cone field.
+    Targets the point closest to lane_center_X (not camera centre).
     Never rejects a gap — width used for scoring only.
     """
     safe_left  = left_X_m  + LANE_MARGIN_M
     safe_right = right_X_m - LANE_MARGIN_M
 
     if not blocking_cones:
-        return 0.0
+        return lane_center_X
     if safe_right <= safe_left:
         return (left_X_m + right_X_m) / 2.0
 
@@ -273,10 +275,10 @@ def _find_best_gap(
     cursor = safe_left
     for lo, hi in merged:
         if lo > cursor:
-            gaps.append((cursor, lo, _clearance_target(cursor, lo)))
+            gaps.append((cursor, lo, _clearance_target(cursor, lo, lane_center_X)))
         cursor = max(cursor, hi)
     if safe_right > cursor:
-        gaps.append((cursor, safe_right, _clearance_target(cursor, safe_right)))
+        gaps.append((cursor, safe_right, _clearance_target(cursor, safe_right, lane_center_X)))
 
     if not gaps:
         cursor = safe_left
@@ -286,15 +288,24 @@ def _find_best_gap(
                 w = lo - cursor
                 if w > best_w:
                     best_w = w
-                    best_t = _clearance_target(cursor, lo)
+                    best_t = _clearance_target(cursor, lo, lane_center_X)
             cursor = max(cursor, hi)
         if safe_right > cursor and (safe_right - cursor) > best_w:
-            best_t = _clearance_target(cursor, safe_right)
+            best_t = _clearance_target(cursor, safe_right, lane_center_X)
         return float(np.clip(best_t, safe_left, safe_right))
 
+    track_span = safe_right - safe_left
     best_target, best_score = 0.0, float("-inf")
     for gl, gr, ct in gaps:
-        score = (gr - gl) - GAP_CENTER_WEIGHT * abs(ct)
+        width = gr - gl
+        # Heavy penalty for gaps that touch a grass boundary — prefer interior gaps.
+        edge_penalty = 0.0
+        if abs(gl - safe_left)  < 0.05:
+            edge_penalty = track_span * 0.6
+        if abs(gr - safe_right) < 0.05:
+            edge_penalty = track_span * 0.6
+        # Deviation penalty relative to lane centre, not camera centre.
+        score = width - GAP_CENTER_WEIGHT * abs(ct - lane_center_X) - edge_penalty
         if score > best_score:
             best_score  = score
             best_target = ct
@@ -458,7 +469,8 @@ class ConeAvoider:
         priority = _get_priority_cones(blocking)   # (#6) nearest group only
         self._last_priority = priority
 
-        gap_X_raw = _find_best_gap(priority, corridor_left, corridor_right)
+        gap_X_raw = _find_best_gap(priority, corridor_left, corridor_right,
+                                   lane_center_X=dev_m)
 
         # EMA — snap on side-switch, smooth same-side jitter
         prev_gap = self._gap_target
