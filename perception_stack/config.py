@@ -46,8 +46,8 @@ LANE_ENABLED = True
 # Train:  python scripts/train_stop_sign.py --api-key YOUR_KEY
 # Export: python scripts/export_trt.py  (TensorRT FP16 for Jetson)
 # Use .engine path after export; .pt works for development without TRT
-SIGN_MODEL_PATH      = "perception_stack/weights/stop_sign.engine"  # TensorRT FP16 — built on this Jetson
-SIGN_CONF_THRESH     = 0.60
+SIGN_MODEL_PATH      = "/home/rasd/psu_racing/best.pt"  # TensorRT FP16 — built on this Jetson
+SIGN_CONF_THRESH     = 0.40
 SIGN_IMG_SIZE        = 416
 SIGN_ACCEPT_CLASSES  = {0, 2}    # 0=stop-sign  2=stop-sign-vandalized
 SIGN_SKIP_FRAMES     = 3         # run YOLO every N frames; cache between
@@ -61,7 +61,7 @@ SIGN_YELLOW_S_MIN    = 120
 SIGN_YELLOW_V_MIN    = 150
 SIGN_YELLOW_ROI_FRAC  = 1.3      # expand bbox by this factor when sampling yellow
 SIGN_YELLOW_AREA_FRAC = 0.12     # minimum yellow fraction in expanded roi
-SIGN_FY_APPROX        = 730      # approx. vertical focal length at 720p (px)
+SIGN_FY_APPROX        = 730      # approx. vertical focal length at 720p (px)qqqqqqq
 SIGN_HEIGHT_M         = 0.65     # assumed sign height (m)
 SIGN_BBOX_MIN_FRAC    = 0.35     # bbox height must be ≥ this fraction of expected px height
 
@@ -81,7 +81,7 @@ BRAKE_VALUE       = 255     # brake intensity byte sent with CMD_BRAKE
 
 # ── Target speed setpoints ────────────────────────────────────────────────────
 # Sent as CMD_THROTTLE DATA byte = int(kmh * 10)  →  e.g. 150 = 15.0 km/h
-SPEED_TARGET_STRAIGHT_KMH = 4.0    # nominal speed on straight sections
+SPEED_TARGET_STRAIGHT_KMH = 1.5    # nominal speed on straight sections
 SPEED_TARGET_CURVE_KMH    = 2.0    # reduced speed through corners
 SPEED_CURVE_THRESH        = 0.15   # |κ| (m⁻¹) above which we slow to curve speed
 
@@ -187,7 +187,7 @@ LOST_BRAKE_FRAMES  = 15     # consecutive LOST frames before brake triggers (~50
 
 # ── Stop-sign detection ────────────────────────────────────────────────────────
 # Set False to disable entirely (no GPU, no thread, no brake from sign)
-STOP_SIGN_ENABLED = False
+STOP_SIGN_ENABLED = True
 
 # ── Cone avoidance ────────────────────────────────────────────────────────────
 # Set False to run pure lane-following with no cone awareness
@@ -209,14 +209,14 @@ CONE_Z_MAX_M       = 8.0
 # Cones to the side of the road are ignored entirely.
 AVOIDANCE_TRIGGER_M = 5.0       # engage when a blocking cone enters this range
 AVOIDANCE_RELEASE_M = 6.5       # release only when ALL blocking cones exit this range
-PATH_WIDTH_M        = 1.2       # lateral half-corridor that counts as "blocking"
+PATH_WIDTH_M        = 1.5      # lateral half-corridor that counts as "blocking"
 RETURN_BAND_M       = 0.20      # also require actual deviation < this before releasing
 
 # Gap planner geometry
-GAP_CAR_WIDTH_M     = 1.20      # full vehicle width — measured physically
-GAP_CONE_RADIUS_M   = 0.15      # treat each cone as a cylinder of this radius
-GAP_LOOKAHEAD_M     = 1.6       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
-GAP_CENTER_WEIGHT   = 0.20      # score penalty for gaps away from lane centre — width dominates
+GAP_CAR_WIDTH_M     = 1.4       # full vehicle width — measured physically
+GAP_CONE_RADIUS_M   = 0.18      # treat each cone as a cylinder of this radius
+GAP_LOOKAHEAD_M     = 2.2       # Z of synthetic gap waypoint — shorter = more aggressive turn-in
+GAP_CENTER_WEIGHT   = 0.20      # score penalty for gaps away from lane centre
 LANE_MARGIN_M       = 0.10      # min distance from grass edge for gap targets (loose — tunable)
 
 # Speed during avoidance — slow for precise manoeuvring
