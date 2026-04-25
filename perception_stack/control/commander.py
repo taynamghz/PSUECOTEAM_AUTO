@@ -164,7 +164,7 @@ class Commander:
     @staticmethod
     def _target_speed(result: PerceptionResult) -> float:
         """Avoidance < curve < straight — slowest always wins during manoeuvring."""
-        if result.avoidance_state == "AVOIDING":
+        if result.avoidance_state in ("AVOIDING", "RETURNING"):
             return SPEED_AVOID_KMH
         if abs(result.curvature) > SPEED_CURVE_THRESH:
             return SPEED_TARGET_CURVE_KMH
@@ -192,7 +192,7 @@ class Commander:
         """
         # During active cone avoidance the gap waypoint is valid regardless of
         # Segformer confidence — skip the lane-quality guard so the car steers.
-        avoiding = result.avoidance_state == "AVOIDING" and result.lookahead_point is not None
+        avoiding = result.avoidance_state in ("AVOIDING", "RETURNING") and result.lookahead_point is not None
         if not avoiding:
             if result.source in ("DISABLED", "NONE", "LOST") or result.confidence < 0.15:
                 return 0.0
