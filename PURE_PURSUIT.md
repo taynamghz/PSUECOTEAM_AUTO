@@ -1,6 +1,7 @@
 # Pure Pursuit Controller — Testing & Tuning Guide
 
-**PSU Eco Racing — Shell Eco-Marathon Autonomous Division**
+**PSU Eco Racing — Shell Eco-Marathon Autonomous Division**  
+*Author: Taynam Al-Zamel, PSU Eco Racing Team III*
 
 ---
 
@@ -357,4 +358,55 @@ This is less accurate geometrically but keeps the car correcting. The lane deadb
 
 ---
 
-*PSU Eco Racing — Shell Eco-Marathon Autonomous Division*
+## 11. Segformer — Training & TensorRT Export
+
+Pure Pursuit depends entirely on Segformer providing accurate lane boundaries. If Segformer performs poorly on your specific track surface, retrain it.
+
+### Quick check: is Segformer working?
+
+```bash
+python -m perception_stack.main   # UART_ENABLED = False
+```
+Watch `Source` in the console. It should show `SEGFORMER` on clear road, not `LOST`. If `LOST` appears often:
+- Try the ONNX model first: ensure `SEG_ONNX_PATH = "segformer_road.onnx"` points to the tuned model
+- Lower `SEG_CONF_THRESHOLD` from 0.35 → 0.20 in config.py
+- The HuggingFace fallback may work fine on paved surfaces without retraining
+
+### Retraining on your track (optional but recommended)
+
+```bash
+# 1. Collect 200–500 frames from ZED during a slow manual drive
+# 2. Label drivable area in Roboflow (binary: road / not-road)
+# 3. Export dataset as HuggingFace SemanticSegmentation format
+# 4. Fine-tune:
+pip install transformers datasets torch
+python scripts/train_segformer.py \
+    --dataset ./path/to/dataset \
+    --base-model nvidia/segformer-b2-finetuned-cityscapes-1024-1024 \
+    --epochs 20 \
+    --output ./segformer_road_finetuned
+
+# 5. Export to ONNX then TRT (run ON the Jetson):
+python scripts/export_trt.py --model segformer --source segformer_road_finetuned
+# Output: segformer_road.onnx → segformer_road.engine
+
+# 6. Update config.py:
+# SEG_ENGINE_PATH  = "segformer_road.engine"
+# SEG_ROAD_CLASSES = [1]   ← tuned 2-class model: 0=background, 1=road
+```
+
+**Speed improvement on Orin Nano:** HuggingFace ~35 ms → TRT FP16 ~8 ms
+
+### What breaks if Segformer is wrong
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Car permanently steers toward one edge | Road mask clipped to that side | Retrain or adjust `SEG_FIT_TOP_FRAC` |
+| S-swerves on straights | `heading_angle` jumps | Lower `CTRL_HEADING_ALPHA` → 0.10 |
+| `Source = LOST` constantly | Segformer not detecting road | Lower `SEG_CONF_THRESHOLD` → 0.20 |
+| Works on test but fails on actual track | Training distribution mismatch | Collect track frames, fine-tune |
+
+---
+
+*PSU Eco Racing — Shell Eco-Marathon Autonomous Division*  
+*Taynam Al-Zamel, Prince Sultan University*

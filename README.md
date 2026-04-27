@@ -1,42 +1,50 @@
-# PSU Eco Racing — Autonomous Perception Stack
-**Prince Sultan University | Shell Eco-Marathon Urban Concept 2026**
-**Venue:** Silesia Ring, Kamień Śląski, Poland | **Target speed:** 10–15 km/h
+# PSU Eco Racing — Autonomous Perception & Control Stack
+
+**Author:** Taynam Al-Zamel  
+**Team:** PSU Eco Racing Team III — Prince Sultan University  
+**Competition:** Shell Eco-Marathon Urban Concept 2026 — Silesia Ring, Kamień Śląski, Poland
 
 ---
 
 ## Overview
 
-Real-time autonomous perception and control stack for the PSU Eco Racing Shell Eco-Marathon vehicle. Runs on a **Jetson Orin Nano 8GB Super** with a **ZED 2i stereo camera**, communicates with an **STM32 Nucleo H743** low-level controller over binary UART.
+Full autonomous drive stack for the PSU Eco Racing Shell Eco-Marathon vehicle.
 
-The stack detects the drivable area using **Segformer semantic segmentation**, computes steering via **Pure Pursuit**, and sends throttle/steer/brake setpoints to the Nucleo. The Nucleo runs its own PID — the Jetson only sends target values.
+The system runs on a **Jetson Orin Nano 8GB Super** + **ZED 2i** stereo camera. It detects the drivable area using **Segformer semantic segmentation**, avoids cones using **YOLOv5 + 3-state gap planner**, detects stop signs with **YOLOv8**, and follows the lane using **Pure Pursuit geometry**. All steering/speed/brake setpoints are sent over UART to an **STM32 Nucleo H723** low-level controller that runs closed-loop PID internally.
 
 ```
-ZED 2i Camera (720p, 30 FPS)
+ZED 2i Camera (HD720 30 FPS)
         │
         ▼
-  CLAHE Normalisation        ← lighting invariance (LAB L-channel)
+  CLAHE Normalisation (LAB L-channel — lighting invariance)
         │
-        ├──► SegformerLane (background thread)
-        │       Segformer-B2 cityscapes → road mask → boundary polynomials
-        │       → deviation_m, heading_angle, curvature
+        ├──► SegformerLane [background thread]
+        │       road mask → left/right boundary polynomials
+        │       → deviation_m, heading_angle, curvature κ
         │
-        ├──► StopSignDetector (background thread)
-        │       YOLOv8 → yellow-board gate → vote → confirmed sign + dist
+        ├──► ConeAvoider [background YOLO thread]
+        │       YOLOv5 cones → ZED depth → 3D positions
+        │       3-state machine: LANE_FOLLOW → AVOIDING → RETURNING
+        │       gap planner → gap waypoint (X_m, Z_m)
         │
-        ├──► detect_stop_line()
-        │       orange HSV → row density → width gate → temporal vote
+        ├──► StopSignDetector [background thread]
+        │       YOLOv8 → yellow-board gate → ZED distance → vote
         │
-        └──► PerceptionResult
-                │
-                ▼
-         Commander  (Pure Pursuit + anti-jitter stack)
-                │
-                ▼
-         UART → STM32 Nucleo H743
-           CMD_STEER     → steering angle  (0=full-left, 127=centre, 255=full-right)
-           CMD_THROTTLE  → target speed    (byte = km/h × 10)
-           CMD_BRAKE     → emergency stop  (val = 255)
-           ← CMD_SPEED_REPORT ← actual speed from Nucleo (tenths of km/h)
+        └──► StopLineDetector
+                orange HSV → row density → stripe width gate → vote
+                        │
+                        ▼
+                 PerceptionResult
+                        │
+                        ▼
+                 Commander (Pure Pursuit + anti-jitter)
+                        │
+                        ▼
+                 UART → STM32 Nucleo H723 (LLC)
+                   CMD_STEER     0–255  (127 = straight)
+                   CMD_THROTTLE  byte = km/h × 10
+                   CMD_BRAKE     emergency stop
+                   ← speed feedback from Nucleo
 ```
 
 ---
@@ -44,240 +52,440 @@ ZED 2i Camera (720p, 30 FPS)
 ## Repository Structure
 
 ```
-perception_stack/
-├── main.py                   Entry point — main loop, telemetry logger, display
-├── config.py                 All tunable parameters (no magic numbers in code)
-├── models.py                 PerceptionResult dataclass — single output contract
-├── visualization.py          OpenCV debug overlay (UART commands, lanes, HUD)
+AdhamTeam/
 │
-├── perception/
-│   ├── pipeline.py           LanePerception — orchestrates every frame
-│   └── segformer_lane.py     Segformer-B2 drivable-area detector (async thread)
+├── perception_stack/           Jetson Python stack
+│   ├── main.py                 Entry point, telemetry logger, display loop
+│   ├── config.py               All tunable parameters — edit here, nowhere else
+│   ├── models.py               PerceptionResult dataclass — inter-module contract
+│   ├── visualization.py        OpenCV debug overlay (HUD, UART bytes, lane + cone debug)
+│   │
+│   ├── perception/
+│   │   ├── pipeline.py         LanePerception — orchestrates every frame
+│   │   └── segformer_lane.py   Segformer-B2 async worker thread
+│   │
+│   ├── lane/
+│   │   ├── fitting.py          Polynomial evaluation helpers
+│   │   └── control.py          heading, curvature, lookahead, ControlSmoother
+│   │
+│   ├── detection/
+│   │   ├── cone_avoider.py     3-state avoidance planner + YOLOv5 cone detector
+│   │   ├── stop_line.py        Orange stripe detector (6-gate pipeline)
+│   │   ├── stop_sign.py        YOLOv8 stop sign with yellow-board SEM gate
+│   │   └── road_validator.py   Post-Segformer grass boundary trimmer
+│   │
+│   ├── control/
+│   │   ├── commander.py        Pure Pursuit → rate-limit → EMA → UART bytes
+│   │   └── uart.py             5-byte CRC-framed binary protocol to Nucleo
+│   │
+│   ├── weights/
+│   │   ├── stop_sign.pt        YOLOv8 stop sign weights (→ .engine after TRT export)
+│   │   └── best (cones).pt     YOLOv5 cone weights (→ .engine after TRT export)
+│   │
+│   └── scripts/
+│       ├── export_trt.py       Export YOLO + Segformer to TensorRT FP16
+│       └── train_stop_sign.py  Roboflow fine-tune for SEM stop sign
 │
-├── lane/
-│   ├── fitting.py            eval_x() — polynomial evaluation helper
-│   └── control.py            heading angle, curvature, lookahead, ControlSmoother
+├── LLC/                        STM32CubeIDE project — Nucleo H723 firmware
+│   ├── Core/Src/main.c         All application logic (speed PID, steer PD, UART protocol)
+│   ├── Core/Inc/main.h         Pin definitions and peripheral handles
+│   ├── LLC-2.ioc               CubeMX project file (regenerate HAL from here)
+│   └── Drivers/                STM32 HAL library (auto-generated by CubeMX)
 │
-├── detection/
-│   ├── stop_line.py          Orange stripe detection with physical width validation
-│   └── stop_sign.py          Threaded YOLOv8 with yellow-board gate (SEM-specific)
+├── tools/
+│   └── steer_tuner.py          Live serial plot of speed + steering angle vs target
 │
-└── control/
-    ├── commander.py          Pure Pursuit + anti-jitter → UART setpoints every frame
-    └── uart.py               5-byte binary framed protocol to STM32 with CRC-8
+├── README.md                   This file
+├── PURE_PURSUIT.md             Pure Pursuit theory, calibration, and troubleshooting
+├── TUNING.md                   Complete parameter reference for all config.py knobs
+└── CONE_AVOIDANCE.md           Cone avoidance architecture and gap planner details
 ```
 
 ---
 
-## How the Pipeline Works
+## Modules In Detail
 
 ### 1. CLAHE Normalisation
-Every frame before any processing:
+
+Applied every frame before any detection:
 ```
-BGR → LAB → CLAHE on L channel → LAB → BGR
+BGR → LAB → CLAHE on L-channel (clip=2.0, tile=8×8) → LAB → BGR
 ```
-Makes colour thresholds invariant to auto-exposure, shadows, and outdoor lighting.
-
-### 2. Drivable Area Detection (Segformer)
-
-`SegformerLane` runs **nvidia/segformer-b2-finetuned-cityscapes-1024-1024** in a background thread. The main thread never blocks on inference.
-
-```
-frame → Segformer → semantic mask (class 0 = road/drivable)
-    → scan left  boundary each row → left polynomial  lf
-    → scan right boundary each row → right polynomial rf
-    → midpoint of lf + rf          → deviation_m  (lateral offset from centre)
-    → polynomial 1st derivative    → heading_angle
-    → polynomial 2nd derivative    → curvature κ (m⁻¹)
-```
-
-**Adaptive submission rate:**
-
-| Condition | Segformer rate | Reason |
-|-----------|---------------|--------|
-| Straight `\|κ\| < 0.15` | ~6 Hz (1 in 5 frames) | Road shape barely changes; EMA carries the polynomial |
-| Curve `\|κ\| ≥ 0.15` | ~30 Hz (every frame) | Maximum freshness for steering accuracy |
-
-**Thread pattern:**
-- `submit()` — drops stale queued frame if worker busy (no inference lag accumulation)
-- `get_result()` — instant lock-read, always returns most recent completed result
-
-### 3. Stop Line Detection
-Six sequential gates (all must pass):
-1. Road mask — drivable-area pixels only
-2. Orange HSV — hue 5–20°, S ≥ 150, V ≥ 100
-3. Row density — ≥ 8% of frame width orange
-4. PCA perpendicularity — cluster within ±20° of horizontal
-5. Physical stripe width — orange spans ≥ 70% of lane width (rejects cones, debris)
-6. Temporal vote — 5 consecutive frames (drops to 3 if stop sign pre-armed at 3–8 m)
-
-### 4. Stop Sign Detection (YOLOv8)
-Runs in its own thread. SEM-specific hardening on every detection:
-- **Yellow board gate** — checks for yellow HSV (hue 18–38°, S ≥ 120) in 1.3× expanded bbox
-- **Bbox height sanity** — expected height ≈ `(0.65m / dist) × 730px`; rejects too-small detections
-- Confidence threshold: 0.60
-- 3-frame temporal voting
-
-### 5. Pure Pursuit Steering
-
-Every frame:
-```
-steer_rad = atan(deviation_m / lookahead_m) − heading_angle
-```
-`deviation_m > 0` = vehicle left of centre → steer right.
-`heading_angle` = road direction feed-forward for curve anticipation.
-
-**Anti-jitter stack:**
-```
-Pure Pursuit
-    → clamp ±25°          (hardware limit — right side mechanically restricted)
-    → dead-band 2°        (suppress sub-noise corrections)
-    → rate-limit 8°/frame (single bad Segformer frame moves wheel ≤ 8°)
-    → EMA α=0.40          (~2–3 frame lag, eliminates high-frequency jitter)
-    → encode to 0–255 byte → CMD_STEER every frame
-```
-
-On `LOST` detection: steering decays 5%/frame toward straight (no snap-to-centre).
-
-### 6. Speed Control
-
-| Condition | Target | Sent as |
-|-----------|--------|---------|
-| Straight `\|κ\| < 0.15` | 15.0 km/h | `CMD_THROTTLE byte=150` |
-| Curve `\|κ\| ≥ 0.15` | 10.0 km/h | `CMD_THROTTLE byte=100` |
-| Stop line/sign ≤ 1.0 m | BRAKE | `CMD_BRAKE byte=255` |
-
-Nucleo PID handles all actuation. Jetson sends target only.
-Actual speed is received from Nucleo RX packets (`CMD_SPEED_REPORT`).
+Makes all HSV colour thresholds (orange stop line, grass boundary, yellow board) robust to shadows, auto-exposure, and sunlight direction.
 
 ---
 
-## UART Protocol
+### 2. Segformer — Drivable Area Detection
 
-### TX — Jetson → Nucleo (5-byte frame)
+**Model:** `nvidia/segformer-b2-finetuned-cityscapes-1024-1024` (HuggingFace fallback)  
+**Production:** TensorRT FP16 engine `segformer_road.engine` — built on the deployment Jetson.
+
+`SegformerLane` runs in a background daemon thread. The main loop never blocks on inference.
+
+```
+frame → resize 640×640 → Segformer → semantic mask
+    → scan each row for left boundary  → lf  (quadratic poly x = ay² + by + c)
+    → scan each row for right boundary → rf
+    → grass validator → trim any boundary that bleeds onto green
+    → centrelineᴱᴹᴬ = (lf + rf) / 2
+    → deviation_m  = (centreline_x_near - W/2) × Z_near / fx
+    → heading_angle = arctan(2a·y_far + b)
+    → curvature κ   = 2a / (1 + slope²)^1.5 × px_per_m
+```
+
+**Adaptive submission rate** (saves GPU on straights):
+
+| Track state | Segformer rate |
+|---|---|
+| Straight `\|κ\| < 0.15` | every 4 frames (~7.5 Hz) |
+| Curve `\|κ\| ≥ 0.15` | every 2 frames (~15 Hz) |
+
+**Tuned model path priority:** TRT engine → ONNX Runtime → HuggingFace
+
+#### Training a custom Segformer (recommended before competition)
+
+The HuggingFace cityscapes model works on typical road surfaces. For best results, fine-tune on your actual track surface:
+
+```bash
+# 1. Collect frames from ZED on your track
+# 2. Label drivable area in Roboflow (class: "road")
+# 3. Export as Semantic Segmentation → HuggingFace format
+# 4. Fine-tune:
+pip install transformers datasets
+python scripts/train_segformer.py --dataset path/to/dataset --epochs 20
+
+# 5. Export to TensorRT FP16 (run ON the Jetson):
+python scripts/export_trt.py --model segformer
+# Output: segformer_road.engine
+# → set SEG_ENGINE_PATH = "segformer_road.engine" in config.py
+```
+
+**Expected speed:** HuggingFace ~35ms/frame → TRT engine ~8ms/frame on Orin Nano.
+
+---
+
+### 3. Cone Avoidance
+
+**Detector:** YOLOv5 (`best (cones).pt`) in background thread, run every `CONE_SKIP_FRAMES` frames.  
+**3D localisation:** ZED body-region depth patch (40–90% of bbox height, 20% horizontal inset, std/median consistency check).
+
+#### 3-State Machine
+
+```
+LANE_FOLLOW
+    │  blocking cone enters AVOIDANCE_TRIGGER_M corridor
+    ▼
+  AVOIDING  ─────────────────────────────────────────────►  timeout (40 frames)
+    │  all blocking cones exit AVOIDANCE_RELEASE_M              │
+    ▼                                                           │
+ RETURNING  ←───────────────────────────────────────────────────┘
+    │  |deviation| < RETURN_BAND_M
+    ▼
+LANE_FOLLOW
+```
+
+- **AVOIDING:** Gap planner runs every frame. Selects best gap (widest, closest to lane centre). Sends gap waypoint to Pure Pursuit.
+- **RETURNING:** Actively commands waypoint `(X=0, Z=GAP_LOOKAHEAD_M)` — Pure Pursuit steers car back to lane centre. Segformer EMA frozen to prevent mid-manoeuvre lane mask corruption.
+- **LANE_FOLLOW:** Normal lane following. TrackWidthEstimator slow-updates corridor bounds (EMA α=0.02).
+
+#### Gap Planner
+
+```
+priority cones (nearest Z-group within 1.5m of closest cone)
+    → exclusion zones: [X - RADIUS, X + RADIUS] per cone
+    → merge overlapping zones
+    → enumerate passable gaps between exclusion zones
+    → clearance target = closest point to LANE_CENTRE inside gap that fits car width
+    → score = gap_width - GAP_CENTER_WEIGHT × |target - lane_centre| - edge_penalty
+    → edge_penalty = 0.6 × track_width for gaps touching grass boundary
+    → EMA smoothing + snap on side-switch
+```
+
+#### Training / swapping the cone model
+
+```bash
+# Train on Roboflow cone dataset:
+python scripts/train_cone.py --weights yolov5s.pt --data cone_dataset.yaml
+
+# Export to TensorRT (on Jetson):
+python scripts/export_trt.py --model cones
+# → set CONE_MODEL_PATH to .engine path in config.py
+```
+
+---
+
+### 4. Stop Sign Detection
+
+**Model:** YOLOv8 (`stop_sign.pt` → TRT `.engine`)  
+**SEM-specific hardening** (rejects generic road stop signs):
+1. Yellow board gate — checks for SEM-yellow HSV (hue 18–38°) in 1.3× expanded bbox
+2. Bbox height sanity — expected height = `(0.65m / dist) × 730px`; rejects tiny distant hits
+3. ZED distance gate — 0.5 m – 15.0 m
+4. 3-frame temporal vote
+
+#### Retraining for SEM (required)
+
+SEM stop sign = red hexagon on a yellow rectangular board. Generic COCO weights miss it.
+
+```bash
+# 1. Collect images of the actual SEM sign (varied distances, lighting)
+# 2. Label in Roboflow, export YOLOv8 format
+# 3. Fine-tune:
+python scripts/train_stop_sign.py --api-key YOUR_ROBOFLOW_KEY
+
+# 4. Export TRT on Jetson:
+python scripts/export_trt.py --model stop_sign
+# → set SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.engine"
+```
+
+---
+
+### 5. Stop Line Detection
+
+Six sequential gates — all must pass:
+
+| Gate | Criterion |
+|---|---|
+| Road mask | pixel must be in drivable area |
+| Orange HSV | hue 5–20°, S ≥ 150, V ≥ 100 |
+| Row density | ≥ 8% of row width is orange |
+| PCA angle | cluster within ±20° of horizontal |
+| Stripe width | spans ≥ 70% of lane width (rejects cones, debris) |
+| Temporal vote | 5 consecutive positive frames |
+
+ZED point cloud samples the stripe centre for metric distance.
+
+---
+
+### 6. Pure Pursuit Steering
+
+```
+delta = atan2(2 × L × X_m,  ld²)
+
+X_m = lateral offset of lookahead point (positive = road right of camera)
+ld  = hypot(X_m, Z_m)   — true Euclidean distance
+L   = WHEELBASE_M = 1.6 m
+
+Anti-jitter chain:
+  raw_deg
+    → rate-limit ±STEER_RATE_LIMIT_DEG per frame    (bad mask protection)
+    → EMA α=STEER_EMA_ALPHA                          (mechanical smoothing)
+    → TX deadband STEER_TX_DEADBAND_DEG              (suppress servo buzz)
+    → encode to 0–255 byte → CMD_STEER
+```
+
+Heading feed-forward: `ff_deg = -heading_angle_deg × HEADING_FF_GAIN`  
+Pre-steers into curves before lateral deviation builds up.
+
+See **PURE_PURSUIT.md** for full calibration procedure.
+
+---
+
+## Low-Level Controller (LLC) — STM32 Nucleo H723
+
+The LLC firmware lives in `LLC/`. It is flashed to the **STM32 Nucleo-H723ZG** board and handles all hard-real-time actuation. The Jetson only sends setpoints — the Nucleo runs PID internally.
+
+### What the Nucleo does
+
+| Function | Implementation |
+|---|---|
+| Speed PID | PI controller at 20 ms, Kp=90, Ki=180, output → Keya motor PWM (TIM3 CH3) |
+| Steering PD | PD at 10 ms, Kp=15, Kd=0, error → CL57T stepper step/dir (TIM17 interrupt) |
+| Steering sensor | AS5600 magnetic encoder over I2C, 12-bit, 100° range |
+| Brake servo | TIM3 CH1 PWM (1833 µs = release, 500 µs = full brake) |
+| EM clutch | GPIO toggle via B1 button (PF5) — must be engaged before driving |
+| Speed sensing | Wheel RPM via hall sensor, TIM2 input capture |
+| RC override | TIM1 input capture on CH1 (steer) + CH2 (throttle) — bypasses Jetson on failsafe |
+| Speed report | Transmits actual speed to Jetson every 500 ms (5-byte frame, 0xBB header) |
+| Watchdog | Commented out in current build — re-enable `JETSON_WATCHDOG_MS` for race |
+
+### UART Protocol
+
+**Jetson → Nucleo (TX, 5 bytes):**
 ```
 [0xAA] [LEN=2] [CMD] [DATA] [CRC8/SMBUS]
 
-CMD_IDLE     = 0x00
-CMD_THROTTLE = 0x01   DATA = int(km/h × 10)   150 → 15.0 km/h
-CMD_BRAKE    = 0x02   DATA = 255
-CMD_STEER    = 0x03   DATA = 0–255  (0=full-left, 127=centre, 255=full-right)
+CMD_IDLE     = 0x00   stops all outputs
+CMD_THROTTLE = 0x01   DATA = (km/h / 30.0) × 255   →  e.g. 85 = ~10 km/h
+CMD_BRAKE    = 0x02   DATA > 0 → full brake, DATA = 0 → release
+CMD_STEER    = 0x03   DATA: 0=full-left, 127=straight, 255=full-right (±25°)
 ```
-Heartbeat retransmit every 80 ms keeps Nucleo 200 ms watchdog alive.
 
-### RX — Nucleo → Jetson (5-byte frame, background reader thread)
+**Nucleo → Jetson (RX, 5 bytes, every 500 ms):**
 ```
-[0xBB] [0x02] [0x10] [DATA] [CRC8]
-DATA = speed in tenths of km/h  e.g. 153 → 15.3 km/h
+[0xBB] [0x02] [0x10] [speed_byte] [CRC8]
+speed_byte = actual_kmh × 10   →  e.g. 153 = 15.3 km/h
 ```
+
+Heartbeat: Jetson retransmits last command every 80 ms to keep the connection alive.
+
+### Flashing the Nucleo
+
+1. Open `LLC/` as a project in **STM32CubeIDE** (File → Open Projects from File System)
+2. Connect Nucleo via USB ST-LINK
+3. Build → Debug/Run (or use the `.launch` file `LLC-2 Debug.launch`)
+4. The `.ioc` file (`LLC-2.ioc`) can be opened in **STM32CubeMX** to regenerate HAL if peripherals change
+
+### Key physical parameters in `main.c`
+
+```c
+#define STEERING_ZERO_DEG   -32.0f   // AS5600 reading at mechanical centre
+#define STEERING_LEFT_DEG   -57.0f   // hard left limit
+#define STEERING_RIGHT_DEG   -7.0f   // hard right limit (mechanically restricted)
+#define SPEED_MAX_KMH        30.0f
+#define SPEED_KP             90.0f
+#define SPEED_KI            180.0f
+#define JETSON_STEER_MAX_DEG 25.0f   // matches STEER_MAX_DEG in config.py
+```
+
+If the steering zero or limits change (servo adjustment, different encoder mounting), update `STEERING_ZERO_DEG`, `STEERING_LEFT_DEG`, `STEERING_RIGHT_DEG` in `main.c` and reflash.
 
 ---
 
-## PerceptionResult — Output Contract
+## Tools
 
-```python
-@dataclass
-class PerceptionResult:
-    deviation_m:        float       # lateral offset from centre (m); + = left of centre
-    confidence:         float       # 0–1 combined detection confidence
-    lane_width_m:       float       # metric lane width (m)
-    source:             str         # "SEGFORMER" / "SEG_PARTIAL" / "LOST" / "DISABLED"
-    left_fit:           np.ndarray  # quadratic poly  x = a·y² + b·y + c
-    right_fit:          np.ndarray
-    left_conf:          float
-    right_conf:         float
-    stop_line:          bool
-    stop_line_dist:     float       # metres to stop line (ZED point cloud)
-    stop_line_y:        int         # image row of stop line
-    stop_sign:          bool
-    stop_sign_dist_m:   float
-    stop_sign_bbox:     tuple       # (x, y, w, h) pixels
-    heading_angle:      float       # radians
-    curvature:          float       # κ (m⁻¹), signed
-    lookahead_point:    tuple       # (X_m, Z_m) world-space Pure Pursuit target
-    lookahead_pixel:    tuple       # (x, y) image pixel
-    speed_kmh:          float       # actual speed from Nucleo UART (filled by Commander)
+### `tools/steer_tuner.py` — Live Steering Monitor
+
+Connect a laptop to the Nucleo USB port (debug UART, USART3 → virtual COM port).  
+The Nucleo prints telemetry every 500 ms. This tool plots it live.
+
+```bash
+pip install pyserial matplotlib
+python tools/steer_tuner.py
+```
+
+Change `PORT` at the top of the script to match your OS:
+- macOS: `/dev/tty.usbmodem11103`
+- Linux: `/dev/ttyACM0`
+- Windows: `COM3` (check Device Manager)
+
+**What it shows:**
+- Top panel: target speed vs actual speed (km/h)
+- Bottom panel: target steer angle vs actual steer angle (degrees)
+- Angle text turns **orange** within 8° of servo limit, **red** within 3°
+
+Use this during initial calibration to verify the steering PD controller tracks the Jetson's commands and that the AS5600 encoder reads correctly.
+
+---
+
+## Running the Stack
+
+```bash
+# On Jetson Orin Nano — from the repo root:
+cd /path/to/AdhamTeam
+python -m perception_stack.main
+
+# Dry run (no UART, no motor output):
+# Set UART_ENABLED = False in perception_stack/config.py
+
+# Headless / SSH:
+# Set DISPLAY = False in perception_stack/config.py
+
+# Keyboard controls during display:
+#   Q — quit
+#   I — toggle idle (stops motors, keeps Jetson running)
+```
+
+**Console output (every 30 frames):**
+```
+Frame |       Source |  Dev(m) |  Steer | Spd | Tgt | Cmd | Stop       | Sign      | Avoidance
+    30 |    SEGFORMER |  +0.032 | +1.2d  | 3.0k | 4.0k |    RUN | -          | -         |
+    60 |    SEGFORMER |  -0.108 | -3.4d  | 3.9k | 4.0k |    RUN | -          | -         | AVOIDING  cones=1  gap=+0.289m
 ```
 
 ---
 
 ## Configuration (`config.py`)
 
-| Section | Key parameters |
-|---------|---------------|
-| Camera | `CAM_RES=HD720`, `CAM_FPS=30`, `CAM_DEPTH_MODE=PERFORMANCE` |
-| CLAHE | `CLAHE_CLIP_LIMIT=2.0`, `CLAHE_TILE_SIZE=(8,8)` |
-| Segformer | `SEG_MODEL_ID`, `SEG_ROAD_CLASSES=[0]`, `SEG_POLY_DEG=2` |
-| Adaptive rate | `SEG_SKIP_STRAIGHT=5`, `SEG_SKIP_CURVE=1` |
-| Stop line | `STOP_WIDTH_MIN_FRAC=0.70`, `STOP_VOTE_NEEDED=5` |
-| Stop sign | `SIGN_CONF_THRESH=0.60`, `SIGN_YELLOW_AREA_FRAC=0.12` |
-| Steering | `STEER_MAX_DEG=25.0`, `STEER_DEADBAND_DEG=2.0`, `STEER_RATE_DEG=8.0`, `STEER_EMA_ALPHA=0.40` |
-| Speed | `SPEED_TARGET_STRAIGHT_KMH=15.0`, `SPEED_TARGET_CURVE_KMH=10.0`, `SPEED_CURVE_THRESH=0.15` |
-| Brake | `STOP_BRAKE_DIST_M=1.0`, `BRAKE_VALUE=255` |
-| Pure Pursuit | `CTRL_LOOKAHEAD_M=2.5`, `CTRL_EVAL_Y_FRAC=0.60` |
-| UART | `UART_PORT=/dev/ttyTHS1`, `UART_BAUD=115200`, `UART_HEARTBEAT_S=0.080` |
+Everything tunable lives in `perception_stack/config.py`. Key sections:
 
----
+| Section | Key params |
+|---|---|
+| Camera | `CAM_RES`, `CAM_FPS`, `CAM_DEPTH_MODE` |
+| Segformer | `SEG_ENGINE_PATH`, `SEG_ROAD_CLASSES`, `SEG_CONF_THRESHOLD` |
+| Pure Pursuit | `WHEELBASE_M`, `CTRL_LOOKAHEAD_M`, `CTRL_LANE_DEADBAND_M` |
+| Steering output | `STEER_MAX_DEG`, `STEER_EMA_ALPHA`, `STEER_RATE_LIMIT_DEG` |
+| Speed | `SPEED_TARGET_STRAIGHT_KMH`, `SPEED_TARGET_CURVE_KMH`, `SPEED_AVOID_KMH` |
+| Cone avoidance | `AVOIDANCE_TRIGGER_M`, `GAP_CAR_WIDTH_M`, `GAP_LOOKAHEAD_M` |
+| Stop sign | `SIGN_MODEL_PATH`, `SIGN_CONF_THRESH`, `SIGN_VOTE_NEEDED` |
+| Stop line | `STOP_BRAKE_DIST_M`, `STOP_VOTE_NEEDED`, `STOP_WIDTH_MIN_FRAC` |
+| UART | `UART_PORT`, `UART_BAUD`, `UART_HEARTBEAT_S` |
 
-## Running
-
-```bash
-# On Jetson — requires ZED SDK, transformers, ultralytics, pyserial
-cd /path/to/AdhamTeam
-python -m perception_stack.main
-
-# Dry run (no UART / no STM32):
-# Set UART_ENABLED = False in config.py
-
-# Headless / SSH:
-# Set DISPLAY = False in config.py
-```
-
----
-
-## Before First Drive — Checklist
-
-| # | Task | Notes |
-|---|------|-------|
-| 1 | YOLO weights at `perception_stack/weights/stop_sign.pt` | Or `.engine` after TRT export |
-| 2 | UART loopback test | Verify Nucleo sends `CMD_SPEED_REPORT` at 115200 |
-| 3 | Orange stop line HSV verified | Photograph actual SEM orange tape, check hue 5–20° |
-| 4 | `STOP_BRAKE_DIST_M` tuned | Default 1.0 m — adjust to vehicle braking distance |
-| 5 | Steering centre confirmed | Byte 127 → straight driving on actual car |
-| 6 | Segformer warmup | First inference ~2–3 s (model load); pipeline returns LOST until ready |
-
-### Stop Sign Retraining (required before competition)
-```bash
-# Current weights: generic US stop signs.
-# SEM sign: red hexagon on yellow rectangular board.
-python scripts/train_stop_sign.py --api-key YOUR_ROBOFLOW_KEY
-python scripts/export_trt.py
-# Then: SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.engine"
-```
-
-### TensorRT Export (run on Jetson before competition)
-```bash
-python scripts/export_trt.py
-# YOLO: ~60ms → ~8ms on Orin Nano
-# Engine is device-specific — build on the deployment Jetson
-```
+See **TUNING.md** for full parameter reference and symptom→fix tables.
 
 ---
 
 ## Hardware Reference
 
 | Component | Spec |
-|-----------|------|
+|---|---|
 | Compute | Jetson Orin Nano 8GB Super |
-| Camera | ZED 2i — 720p, 30 FPS, stereo depth, IMU |
-| LLC | STM32 Nucleo H743 |
-| Drive | D5BLD750-48A-30S + PLF090-10 gearbox (750W, 300 RPM) |
-| Steering | NEMA23 + EG23 gearbox (50:1) + CL57T-V41 closed-loop driver |
-| Steering range | −25° to +25° (right side mechanically limited; physical centre = −10°) |
-| EM Clutch | DLD6-20B 24V 20Nm (fail-safe manual override) |
-| Brake | 2× 35kg.cm servo (dual redundant) |
-| UART | `/dev/ttyTHS1`, 115200 baud, 5-byte framed, CRC-8/SMBUS |
+| Camera | ZED 2i — stereo 720p 30 FPS, depth, IMU |
+| LLC | STM32 Nucleo-H723ZG (STM32H723ZG, 550 MHz Cortex-M7) |
+| Drive motor | D5BLD750-48A-30S brushless + PLF090-10 gearbox (750W, 300 RPM) |
+| Steering motor | NEMA23 stepper + EG23 50:1 gearbox + CL57T-V41 closed-loop driver |
+| Steering sensor | AS5600 magnetic encoder (12-bit, I2C) |
+| Steering range | −25° to +25° (right side mechanically limited; physical centre offset = −10°) |
+| EM Clutch | DLD6-20B 24V 20Nm (B1 button toggle — must engage before autonomous drive) |
+| Brake | Servo via TIM3 CH1 (1833 µs = release, 500 µs = full brake) |
+| Jetson→Nucleo UART | `/dev/ttyTHS1`, LPUART1 on Nucleo, 115200 baud, 5-byte framed CRC-8 |
+| Nucleo debug UART | USART3 → USB virtual COM, 115200 baud (for `steer_tuner.py`) |
 
 ---
 
-*PSU Eco Racing Autonomous Team — 2026*
+## Pre-Flight Checklist
+
+Work through this order before every autonomous run:
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | EM clutch engaged | B1 button on Nucleo — LED confirms, stepper moves |
+| 2 | Dry run: `UART_ENABLED = False` | Verify Segformer source = SEGFORMER, not LOST |
+| 3 | Steering sign test (wheels off ground) | Right of camera → `X_m > 0` → wheels steer right |
+| 4 | UART loopback | Nucleo speed byte received in console |
+| 5 | Weights present | `stop_sign.engine` or `.pt`, `best (cones).pt` at paths in config.py |
+| 6 | `WHEELBASE_M` verified | Measure axle-to-axle in metres — most critical parameter |
+| 7 | Brake distance test | Stop 1 cone at `STOP_BRAKE_DIST_M`, confirm brake fires |
+| 8 | `LOST_BRAKE_ENABLED = True` | Re-enable for race (disable only during initial testing) |
+| 9 | Watchdog in `main.c` | Uncomment `JETSON_WATCHDOG_MS` block for race safety |
+
+---
+
+## TensorRT Export (Jetson — run once per deployment)
+
+TRT engines are device-specific and must be built on the actual Jetson:
+
+```bash
+# Export all models:
+python scripts/export_trt.py
+
+# Or individually:
+python scripts/export_trt.py --model segformer   # segformer_road.engine
+python scripts/export_trt.py --model stop_sign   # weights/stop_sign.engine
+python scripts/export_trt.py --model cones       # weights/best_cones.engine
+
+# Update paths in config.py after export:
+SEG_ENGINE_PATH  = "segformer_road.engine"
+SIGN_MODEL_PATH  = "perception_stack/weights/stop_sign.engine"
+CONE_MODEL_PATH  = "perception_stack/weights/best_cones.engine"
+```
+
+**Speed improvement on Orin Nano (FP16):**
+| Model | PyTorch | TensorRT FP16 |
+|---|---|---|
+| Segformer-B2 | ~35 ms | ~8 ms |
+| YOLOv8 (stop sign) | ~60 ms | ~8 ms |
+| YOLOv5 (cones) | ~45 ms | ~6 ms |
+
+---
+
+## Further Reading
+
+- **PURE_PURSUIT.md** — Pure Pursuit theory, lookahead calibration, step-by-step test procedure, symptom→fix tables
+- **TUNING.md** — Every `config.py` parameter explained with symptom→fix tables for all three phases (lane, cones, stop sign)
+- **CONE_AVOIDANCE.md** — Cone avoidance architecture, 3-state machine, gap planner geometry
+
+---
+
+*PSU Eco Racing Autonomous Division — Shell Eco-Marathon 2026*  
+*Code by Taynam Al-Zamel, Prince Sultan University*

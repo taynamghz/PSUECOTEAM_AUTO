@@ -1,5 +1,7 @@
 # PSU Eco Racing — Perception Stack Tuning Guide
 
+*Author: Taynam Al-Zamel, PSU Eco Racing Team III*
+
 All tunable parameters live in `perception_stack/config.py`.  
 Nothing else needs to be touched to change behaviour.
 
@@ -235,20 +237,34 @@ Set `False` for lane-only testing. No YOLO thread starts, no GPU budget used.
 
 ---
 
+### 3-State Machine Overview
+
+The avoidance system uses three states. Understanding these helps diagnose issues:
+
+```
+LANE_FOLLOW  →(blocking cone < TRIGGER)→  AVOIDING  →(all cones > RELEASE)→  RETURNING  →(|dev| < RETURN_BAND OR 40 frames)→  LANE_FOLLOW
+```
+
+- **LANE_FOLLOW:** Normal Pure Pursuit. TrackWidthEstimator learns corridor bounds slowly (EMA α=0.02).
+- **AVOIDING:** Gap planner runs every frame. Segformer EMA frozen. Car follows gap waypoint.
+- **RETURNING:** Car commanded to X=0 via Pure Pursuit. Segformer EMA still frozen. Exits when recentred or after 40-frame timeout (~1.3s at 30fps).
+
+---
+
 ### Engagement distance
 
 ```python
 AVOIDANCE_TRIGGER_M = 5.0    # engage when blocking cone enters this range
 AVOIDANCE_RELEASE_M = 6.5    # release only when all blocking cones exit this range
-PATH_WIDTH_M        = 1.0    # lateral half-corridor — cones outside this ignored
+PATH_WIDTH_M        = 1.2    # lateral half-corridor — cones outside this ignored
 ```
 
-`RELEASE > TRIGGER` is the hysteresis that prevents rapid toggling.
+`RELEASE > TRIGGER` is the hysteresis that prevents rapid toggling. A cone must be inside the `PATH_WIDTH_M` corridor AND inside the Z range to count as blocking.
 
 | Symptom | Direction |
 |---|---|
 | Starts reacting too late, car is almost on the cone | increase `AVOIDANCE_TRIGGER_M` → 6.5–7.0 |
-| Triggers on cones clearly off to the side | decrease `PATH_WIDTH_M` → 0.7 |
+| Triggers on cones clearly off to the side | decrease `PATH_WIDTH_M` → 0.8 |
 | Toggles in/out rapidly after passing a cone | increase `AVOIDANCE_RELEASE_M` → 8.0 |
 | Stays in avoidance mode long after cones are gone | decrease `AVOIDANCE_RELEASE_M` → 5.5, decrease `RETURN_BAND_M` → 0.10 |
 
@@ -257,22 +273,23 @@ PATH_WIDTH_M        = 1.0    # lateral half-corridor — cones outside this igno
 ### Return-to-centre condition
 
 ```python
-RETURN_BAND_M = 0.20
+RETURN_BAND_M = 0.20   # lateral deviation must be within this to exit RETURNING
 ```
 
-Avoidance only exits when the **actual** lateral deviation (from Segformer) is within this band. Prevents premature release while the car is still offset.
+RETURNING state exits when `|deviation_m| < RETURN_BAND_M` OR after 40-frame timeout.
 
 | Symptom | Direction |
 |---|---|
-| Never exits avoidance even on clear road | increase → 0.35 |
-| Exits too early, re-triggers immediately | decrease → 0.10 |
+| Never exits RETURNING even on clear road | increase → 0.35 |
+| Exits RETURNING too early, re-triggers immediately | decrease → 0.10 |
+| Car still offset when it re-enters LANE_FOLLOW | increase → 0.30 |
 
 ---
 
 ### Gap waypoint distance
 
 ```python
-GAP_LOOKAHEAD_M = 1.8
+GAP_LOOKAHEAD_M = 1.6
 ```
 
 The Z distance of the synthetic waypoint the car aims at during avoidance. Shorter = tighter, more aggressive turn into the gap.
@@ -281,39 +298,43 @@ The Z distance of the synthetic waypoint the car aims at during avoidance. Short
 |---|---|
 | Not steering hard enough, drifts through cones | decrease → 1.2–1.4 |
 | Overshoots gap, oscillates through it | increase → 2.5–3.0 |
+| Sharp early turn-in before reaching gap | increase → 2.0 |
 
-Do not go below 1.0 — below that the Pure Pursuit formula produces near-maximum steer for any non-zero offset.
+Do not go below 1.0 — Pure Pursuit produces near-maximum steer for any lateral offset below that.
 
 ---
 
 ### Gap geometry
 
 ```python
-GAP_CAR_WIDTH_M     = 1.20   # your physical vehicle width — measure this
-GAP_CONE_RADIUS_M   = 0.15   # cone exclusion zone radius
-GAP_CENTER_WEIGHT   = 0.40   # score penalty per metre from lane centre
+GAP_CAR_WIDTH_M     = 1.20   # physical vehicle width — measure this
+GAP_CONE_RADIUS_M   = 0.15   # cone exclusion zone radius — increase for more clearance
+GAP_CENTER_WEIGHT   = 0.20   # gap scoring penalty per metre from lane centre
 LANE_MARGIN_M       = 0.10   # min distance from grass edge for gap target
 ```
 
-`GAP_CAR_WIDTH_M` must be measured physically. It doesn't gate gap selection (no gaps are rejected) but is used for scoring — wider gaps score proportionally higher.
+**`GAP_CAR_WIDTH_M`** — must match physical width. Used to compute minimum clearance inside each gap. Increasing it effectively adds safety margin on both sides of the car.
 
-`GAP_CENTER_WEIGHT`: higher values push the gap selection toward the lane centre when multiple gaps exist.
+**`GAP_CONE_RADIUS_M`** — increases the cone exclusion zone. Larger value = car stays further from cones but fewer gaps may fit.
+
+**`GAP_CENTER_WEIGHT`** — scoring penalty for gaps away from lane centre. Gap score = `width - weight × |target - lane_centre|`. Lower value makes width the dominant factor.
 
 | Symptom | Direction |
 |---|---|
-| Always picks the side gap instead of threading through slot | increase `GAP_CENTER_WEIGHT` → 0.70 |
-| Always goes centre even when side is clearly better | decrease `GAP_CENTER_WEIGHT` → 0.20 |
-| Gap target drifts to grass edge | increase `LANE_MARGIN_M` → 0.20 |
+| Car clips cones when passing | increase `GAP_CONE_RADIUS_M` → 0.20–0.25 |
+| Car goes toward grass boundary instead of open track | check that lane centre (dev_m) is correct; increase `LANE_MARGIN_M` → 0.20 |
+| Always picks narrow gap over wider one | decrease `GAP_CENTER_WEIGHT` → 0.10 |
+| Car undershoots gap, clips cone on exit | increase `GAP_CAR_WIDTH_M` → 1.35 |
 
 ---
 
 ### Avoidance speed
 
 ```python
-SPEED_AVOID_KMH = 1.0
+SPEED_AVOID_KMH = 1.0   # also applies during RETURNING state
 ```
 
-Speed setpoint sent to Nucleo during active cone avoidance. Lower gives more time per metre for the planner to converge.
+Speed sent to Nucleo during both AVOIDING and RETURNING. Lower gives more processing time per metre.
 
 ---
 
@@ -327,12 +348,15 @@ CONE_Z_MAX_M      = 8.0     # reject cones further than this
 CONE_DEPTH_PAD    = 6       # depth patch half-size in pixels
 ```
 
+Cone depth uses body-region sampling (40–90% of bbox height, 20% inset) with a std/median consistency check. If the depth patch is too noisy (std/median > 0.25), the cone is rejected entirely — no fallback depth.
+
 | Symptom | Direction |
 |---|---|
 | Misses some cones | decrease `CONE_CONF_THRESH` → 0.30 |
 | False positive cones (triggers on track markings) | increase `CONE_CONF_THRESH` → 0.55 |
 | Cone positions are noisy / jumping | increase `CONE_DEPTH_PAD` → 10 |
-| YOLO too slow, drop rate is high | increase `CONE_SKIP_FRAMES` → 3 |
+| YOLO too slow, FPS drops | increase `CONE_SKIP_FRAMES` → 3 |
+| Avoidance triggers on far distant cones | decrease `CONE_Z_MAX_M` → 6.0 |
 
 ---
 
