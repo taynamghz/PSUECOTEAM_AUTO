@@ -23,7 +23,7 @@ import logging
 
 from perception_stack.config import (
     UART_ENABLED,
-    STOP_BRAKE_DIST_M, BRAKE_VALUE,
+    STOP_BRAKE_DIST_M, STOP_SIGN_BRAKE_DIST_M, BRAKE_VALUE,
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
     SPEED_AVOID_KMH,
     WHEELBASE_M, CTRL_LOOKAHEAD_M, CTRL_LANE_DEADBAND_M,
@@ -42,7 +42,7 @@ def _deg_to_steer_byte(deg: float) -> int:
     positive deg = steer right → byte > 127
     negative deg = steer left  → byte < 127
     """
-    return int(max(0, min(255, round(127.0 + deg * 127.0 / STEER_MAX_DEG))))
+    return int(max(0, min(255, round(127.0 - deg * 127.0 / STEER_MAX_DEG))))
 
 
 class Commander:
@@ -59,8 +59,9 @@ class Commander:
         cmd.speed_kmh    — current speed received from Nucleo (km/h)
     """
 
-    def __init__(self):
+    def __init__(self, run_n: int = 0):
         self.uart = UARTController()
+        self._run_n = run_n
 
         self._state:          str   = "RUN"
         self.idle_requested:  bool  = False  # toggled externally by 'i' key
@@ -81,7 +82,7 @@ class Commander:
         if not UART_ENABLED:
             log.info("[Commander] UART disabled — dry-run mode")
             return True
-        ok = self.uart.open()
+        ok = self.uart.open(run_n=self._run_n)
         if ok:
             self.uart.idle()
             self.uart.steer(127)   # centre steering on start-up
@@ -140,6 +141,8 @@ class Commander:
                     self.uart.steer(_deg_to_steer_byte(steer))
                     self._last_sent_steer_deg = steer
 
+        self.uart.avoidance_state = result.avoidance_state
+
         if state != self._state:
             log.info("[Commander] %s → %s  src=%s  spd=%.1f km/h  steer=%.1f deg",
                      self._state, state, result.source, self.speed_kmh, steer)
@@ -155,7 +158,7 @@ class Commander:
             return True
         if result.stop_line and 0 < result.stop_line_dist <= STOP_BRAKE_DIST_M:
             return True
-        if result.stop_sign and 0 < result.stop_sign_dist_m <= STOP_BRAKE_DIST_M:
+        if result.stop_sign and 0 < result.stop_sign_dist_m <= STOP_SIGN_BRAKE_DIST_M:
             return True
         return False
 
