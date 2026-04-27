@@ -180,7 +180,7 @@ Wider gaps score higher. The centering term breaks ties by preferring the gap cl
 Set `UART_ENABLED = False`. Run:
 
 ```bash
-cd ~/Documents/Projects/Embedded/shell\ autonomous/AdhamTeam
+cd ~/Documents/Projects/Embedded/shell\ autonomous/PSUECOTEAM_AUTO
 python obstacle_avoidance.py
 ```
 
@@ -318,8 +318,8 @@ If avoidance does trigger: `PATH_WIDTH_M` is too wide. Lower to `0.80`.
 ## 10. Running as Standalone
 
 ```bash
-# From AdhamTeam directory
-cd ~/Documents/Projects/Embedded/shell\ autonomous/AdhamTeam
+# From PSUECOTEAM_AUTO directory
+cd ~/Documents/Projects/Embedded/shell\ autonomous/PSUECOTEAM_AUTO
 
 # Dry run (no motor output, display only)
 # Set UART_ENABLED = False in config block first

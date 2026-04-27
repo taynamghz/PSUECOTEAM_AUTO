@@ -52,7 +52,7 @@ ZED 2i Camera (HD720 30 FPS)
 ## Repository Structure
 
 ```
-AdhamTeam/
+PSUECOTEAM_AUTO/
 │
 ├── perception_stack/           Jetson Python stack
 │   ├── main.py                 Entry point, telemetry logger, display loop
@@ -372,7 +372,7 @@ Use this during initial calibration to verify the steering PD controller tracks 
 
 ```bash
 # On Jetson Orin Nano — from the repo root:
-cd /path/to/AdhamTeam
+cd /path/to/PSUECOTEAM_AUTO
 python -m perception_stack.main
 
 # Dry run (no UART, no motor output):

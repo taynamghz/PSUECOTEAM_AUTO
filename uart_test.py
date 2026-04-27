@@ -1,6 +1,6 @@
 """
 UART Manual Test — PSU Eco Racing
-Run from AdhamTeam/:  python3 uart_test.py
+Run from PSUECOTEAM_AUTO/:  python3 uart_test.py
 
 Keys:
   s → enter steering angle in degrees  (-STEER_MAX to +STEER_MAX, 0 = centre)
